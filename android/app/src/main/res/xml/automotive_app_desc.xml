@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<automotiveApp>
+    <uses name="media" />
+    <!-- Car App Library service (CarVideoService) that gives the shared ExoPlayer the car Surface. -->
+    <uses name="template" />
+</automotiveApp>

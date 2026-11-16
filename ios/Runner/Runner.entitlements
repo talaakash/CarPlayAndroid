@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- CarPlay Audio app entitlement. Requires Apple approval:
+	     https://developer.apple.com/carplay/ -->
+	<key>com.apple.developer.carplay-audio</key>
+	<true/>
+	<!-- TODO(carplay-video): CarPlay video is a separate entitlement that Apple grants per
+	     app. Request it at https://developer.apple.com/carplay/ and, once approved, add the
+	     exact key name shown in the Developer Portal (Certificates, Identifiers & Profiles >
+	     Identifiers > your App ID > Additional Capabilities) to this file and regenerate the
+	     provisioning profile. The key is intentionally not guessed here: an unknown
+	     entitlement makes signing fail. The app already requests video presentation through
+	     CPPlaybackConfiguration and falls back to audio / Now Playing without it. -->
+</dict>
+</plist>

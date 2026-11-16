@@ -1,0 +1,29 @@
+name: car_play
+description: Flutter IPTV player with Android Auto and CarPlay support.
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.14.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  material_ui: ^1.1.0
+  iptv_native:
+    path: packages/iptv_native
+  provider: ^6.1.5+1           # state management
+  http: ^1.5.0                 # playlist download
+  cached_network_image: ^3.4.1 # channel logos
+  shared_preferences: ^2.5.3   # IPTV settings / theme
+  wakelock_plus: ^1.4.0        # keep the screen on while watching
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/json/country.json

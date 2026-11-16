@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Car displays can be curved or non-rectangular. Parked-app guideline AR-2 forbids the
+         DEFAULT and SHORT_EDGES cutout modes, so use ALWAYS (3) on car-qualified displays. -->
+    <integer name="windowLayoutInDisplayCutoutMode">3</integer>
+</resources>
