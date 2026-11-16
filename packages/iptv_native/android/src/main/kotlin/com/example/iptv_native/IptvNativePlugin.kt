@@ -88,6 +88,7 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
         IptvStorage.onUserDataChanged = { main.post { emit(mapOf("type" to "userData")) } }
         IptvStorage.onSelectionChanged = { sel -> main.post { emit(selectionMap(sel)) } }
         IptvPlaybackService.onCarSurfaceCleared = { main.post { reattachPhoneVideo() } }
+        IptvStorage.addChangeListener(changeListener)
         carConnection = CarConnection(appContext).also { it.type.observeForever(connectionObserver) }
         withController { }  // connect early so state is available to Flutter
     }
@@ -99,6 +100,7 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
         IptvStorage.onUserDataChanged = null
         IptvStorage.onSelectionChanged = null
         IptvPlaybackService.onCarSurfaceCleared = null
+        IptvStorage.removeChangeListener(changeListener)
         carConnection?.type?.removeObserver(connectionObserver)
         carConnection = null
         // The service (and its playback) keeps running; only release our controller.
@@ -203,6 +205,19 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
         )
     }
 
+    private fun settingsMap() = mapOf(
+        "type" to "settings",
+        "output" to IptvStorage.outputMode(appContext),
+        "fit" to IptvStorage.videoFit(appContext),
+    )
+
+    private val changeListener: (String) -> Unit = { kind ->
+        if (kind == "settings") main.post {
+            IptvPlaybackService.setFill(IptvStorage.videoFit(appContext) == IptvStorage.FILL)
+            emit(settingsMap())
+        }
+    }
+
     private fun selectionMap(sel: IptvStorage.Selection) = mapOf(
         "type" to "selection", "scope" to sel.scope, "label" to sel.label,
         "version" to sel.version, "origin" to sel.origin,
@@ -221,6 +236,7 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
         emit(connectionMap())
         emit(selectionMap(IptvStorage.selection(appContext)))
         emit(ParkedVideoPolicy.toMap())
+        emit(settingsMap())
     }
     override fun onCancel(arguments: Any?) { sink = null }
 
@@ -261,6 +277,15 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
                     else -> ParkedVideoPolicy.Simulation.OFF
                 }
                 result.success(ParkedVideoPolicy.simulate(mode))
+            }
+            "settings" -> result.success(settingsMap())
+            "setOutput" -> {
+                IptvStorage.setOutputMode(appContext, call.argument<String>("output") ?: IptvStorage.OUTPUT_PHONE)
+                result.success(null)
+            }
+            "setFit" -> {
+                IptvStorage.setVideoFit(appContext, call.argument<String>("fit") ?: IptvStorage.FIT)
+                result.success(null)
             }
             "connection" -> result.success(connectionMap())
             "selection" -> result.success(selectionMap(IptvStorage.selection(appContext)))

@@ -17,6 +17,34 @@ enum CommandOrigin {
       CommandOrigin.values.firstWhere((o) => o.name == v, orElse: () => CommandOrigin.phone);
 }
 
+/// Where the video is rendered. The other surface shows channel artwork and controls only.
+enum VideoOutput {
+  phone,
+  car;
+
+  static VideoOutput parse(String? v) =>
+      VideoOutput.values.firstWhere((o) => o.name == v, orElse: () => VideoOutput.phone);
+}
+
+/// Fit = whole picture with bars, fill = cover the screen (crop). Shared by phone and car.
+enum VideoFit {
+  fit,
+  fill;
+
+  static VideoFit parse(String? v) =>
+      VideoFit.values.firstWhere((o) => o.name == v, orElse: () => VideoFit.fit);
+}
+
+/// Player settings kept natively so the phone and the car always agree.
+class PlayerSettings {
+  const PlayerSettings({this.output = VideoOutput.phone, this.fit = VideoFit.fit});
+  final VideoOutput output;
+  final VideoFit fit;
+
+  factory PlayerSettings.fromMap(Map<Object?, Object?> m) =>
+      PlayerSettings(output: VideoOutput.parse(m['output'] as String?), fit: VideoFit.parse(m['fit'] as String?));
+}
+
 enum CarPlatform { none, androidAuto, androidAutomotive, carPlay }
 
 /// Connection as reported by the platform (CarConnection on Android, CarPlay scene on iOS).
@@ -175,6 +203,23 @@ class IptvNative {
   Stream<BrowseSelection> get browseSelection => _raw
       .where((e) => e['type'] == 'selection')
       .map(BrowseSelection.fromMap);
+
+  /// Output / fit changes, from the phone or the car.
+  Stream<PlayerSettings> get playerSettings => _raw
+      .where((e) => e['type'] == 'settings')
+      .map(PlayerSettings.fromMap);
+
+  Future<PlayerSettings> currentPlayerSettings() async {
+    try {
+      final m = await _method.invokeMethod<Map<Object?, Object?>>('settings');
+      return m == null ? const PlayerSettings() : PlayerSettings.fromMap(m);
+    } on MissingPluginException {
+      return const PlayerSettings();
+    }
+  }
+
+  Future<void> setVideoOutput(VideoOutput o) => _method.invokeMethod('setOutput', {'output': o.name});
+  Future<void> setVideoFit(VideoFit f) => _method.invokeMethod('setFit', {'fit': f.name});
 
   Stream<ParkedVideoInfo> get parkedVideo => _raw
       .where((e) => e['type'] == 'parkedVideo')

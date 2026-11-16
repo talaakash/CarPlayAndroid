@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 
 import 'iptv/iptv_repository.dart';
 import 'iptv/ui/iptv_home.dart';
+import 'iptv/ui/mini_player.dart';
 
 void main() {
   runApp(const MyApp());
@@ -90,6 +91,7 @@ class _MyHomePageState extends State<MyHomePage> {
         ),
         actions: [if (repo != null) ...iptvAppBarActions(context, repo)],
       ),
+      bottomNavigationBar: repo == null ? null : MiniPlayer(repo: repo),
       body: Column(
         children: [
           Expanded(

@@ -114,6 +114,7 @@ class IptvPlaybackService : MediaLibraryService() {
         }
         session = builder.build()
         updateFavoriteButton()
+        fillMode = IptvStorage.videoFit(applicationContext) == IptvStorage.FILL
         applyCarSurface() // the car may have offered a Surface before the player existed
         registerNetworkCallback()
         ParkedVideoPolicy.addListener(policyListener)
@@ -144,6 +145,28 @@ class IptvPlaybackService : MediaLibraryService() {
         val s = session ?: return
         for (c in s.connectedControllers) {
             s.setAvailableCommands(c, sessionCommands(), channelPlayer.availableCommands)
+        }
+    }
+
+    /**
+     * The car Surface stretches whatever the codec produces, so Fit / Fill is done with a
+     * Presentation effect that renders into a frame of the surface's aspect ratio (bars for
+     * Fit, crop for Fill). Effects are active only while the car owns the output; the phone
+     * view keeps the untouched stream and is scaled in Flutter.
+     */
+    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+    private fun applyVideoLayout() {
+        main.post {
+            val w = carWidth
+            val h = carHeight
+            val effects = if (carSurface != null && w > 0 && h > 0) {
+                val layout = if (fillMode) androidx.media3.effect.Presentation.LAYOUT_SCALE_TO_FIT_WITH_CROP
+                else androidx.media3.effect.Presentation.LAYOUT_SCALE_TO_FIT
+                listOf<androidx.media3.common.Effect>(
+                    androidx.media3.effect.Presentation.createForAspectRatio(w.toFloat() / h, layout)
+                )
+            } else emptyList()
+            try { player.setVideoEffects(effects) } catch (_: Throwable) { /* unsupported device: stretched video */ }
         }
     }
 
@@ -757,16 +780,31 @@ class IptvPlaybackService : MediaLibraryService() {
         @Volatile
         var onCarSurfaceCleared: (() -> Unit)? = null
 
-        fun setCarSurface(surface: android.view.Surface) {
+        /** Pixel size of the car Surface (0 = unknown) and the current Fit / Fill mode. */
+        @Volatile private var carWidth = 0
+        @Volatile private var carHeight = 0
+        @Volatile private var fillMode = false
+
+        fun setCarSurface(surface: android.view.Surface, width: Int = 0, height: Int = 0) {
             carSurface = surface
+            carWidth = width
+            carHeight = height
             instance?.applyCarSurface()
+            instance?.applyVideoLayout()
         }
 
         fun clearCarSurface() {
             val old = carSurface ?: return
             carSurface = null
             instance?.player?.clearVideoSurface(old)
+            instance?.applyVideoLayout()
             onCarSurfaceCleared?.invoke()
+        }
+
+        /** Fit (letterbox) / Fill (crop) for the car video. The phone scales in Flutter. */
+        fun setFill(fill: Boolean) {
+            fillMode = fill
+            instance?.applyVideoLayout()
         }
 
         /** mediaId format: ch|<scope>|<channelId>. */
@@ -785,6 +823,7 @@ class IptvPlaybackService : MediaLibraryService() {
         }
 
         fun refreshLibrary() {
+            IptvStorage.fireChange("data") // car screens reload their lists
             instance?.apply {
                 main.post {
                     for (id in listOf(ROOT, PLAYLISTS, PLAYLIST_ACTIVE, FAVORITES, RECENTS, CATEGORIES, COUNTRIES, AZ)) {

@@ -90,6 +90,12 @@ public final class IptvNativePlugin: NSObject, FlutterPlugin, FlutterStreamHandl
         switch call.method {
         case "storageDirectory": result(IptvStorage.shared.directory.path)
         case "state": result(stateMap())
+        case "settings":
+            result(["type": "settings", "output": UserDefaults.standard.string(forKey: "iptv.output") ?? "phone",
+                    "fit": UserDefaults.standard.string(forKey: "iptv.fit") ?? "fit"])
+        // iOS: the preference is stored and mirrored in Flutter; CarPlay video routing is system-decided.
+        case "setOutput": UserDefaults.standard.set(args?["output"] as? String ?? "phone", forKey: "iptv.output"); result(nil)
+        case "setFit": UserDefaults.standard.set(args?["fit"] as? String ?? "fit", forKey: "iptv.fit"); result(nil)
         case "connection": result(connectionMap())
         case "selection": result(selectionMap(IptvStorage.shared.selection()))
         case "setSelection":

@@ -32,6 +32,49 @@ object IptvStorage {
     @Volatile
     var onUserDataChanged: (() -> Unit)? = null
 
+    // ---- change hub: lets the car session (same process) react to any shared-data change ----
+
+    private val changeListeners = java.util.concurrent.CopyOnWriteArrayList<(String) -> Unit>()
+
+    /** kind: "data" (favorites / recents / channels), "settings" (output, fit), "selection". */
+    fun addChangeListener(l: (String) -> Unit) { changeListeners.addIfAbsent(l) }
+    fun removeChangeListener(l: (String) -> Unit) { changeListeners.remove(l) }
+    fun fireChange(kind: String) { for (l in changeListeners) l(kind) }
+
+    // ---- player settings shared by phone and car (single source of truth) ----
+
+    const val OUTPUT_PHONE = "phone"
+    const val OUTPUT_CAR = "car"
+    const val FIT = "fit"
+    const val FILL = "fill"
+
+    private fun prefs(context: Context) =
+        context.applicationContext.getSharedPreferences("iptv_native_prefs", Context.MODE_PRIVATE)
+
+    /** Where the video is rendered: "phone" or "car". */
+    fun outputMode(context: Context): String =
+        prefs(context).getString("output", OUTPUT_PHONE).takeIf { it == OUTPUT_CAR } ?: OUTPUT_PHONE
+
+    /** "fit" (letterbox) or "fill" (crop), applied to both phone and car. */
+    fun videoFit(context: Context): String =
+        prefs(context).getString("fit", FIT).takeIf { it == FILL } ?: FIT
+
+    fun setOutputMode(context: Context, mode: String): Boolean {
+        val v = if (mode == OUTPUT_CAR) OUTPUT_CAR else OUTPUT_PHONE
+        if (outputMode(context) == v) return false
+        prefs(context).edit().putString("output", v).commit()
+        fireChange("settings")
+        return true
+    }
+
+    fun setVideoFit(context: Context, fit: String): Boolean {
+        val v = if (fit == FILL) FILL else FIT
+        if (videoFit(context) == v) return false
+        prefs(context).edit().putString("fit", v).commit()
+        fireChange("settings")
+        return true
+    }
+
     private val lock = Any()
     private var cachedStamp = -1L
     private var cachedChannels: List<Channel> = emptyList()
@@ -127,7 +170,7 @@ object IptvStorage {
             tmp.writeText(JSONObject().put("favorites", JSONArray(ids)).toString())
             if (!tmp.renameTo(f)) { f.delete(); tmp.renameTo(f) }
         }
-        onUserDataChanged?.invoke()
+        run { onUserDataChanged?.invoke(); fireChange("data") }
         return now
     }
 
@@ -154,12 +197,12 @@ object IptvStorage {
             ids.add(0, id)
             writeRecents(f, ids.take(MAX_RECENTS))
         }
-        onUserDataChanged?.invoke()
+        run { onUserDataChanged?.invoke(); fireChange("data") }
     }
 
     fun clearRecents(context: Context) {
         synchronized(lock) { writeRecents(file(context, "recents.json"), emptyList()) }
-        onUserDataChanged?.invoke()
+        run { onUserDataChanged?.invoke(); fireChange("data") }
     }
 
     private fun writeRecents(f: File, ids: List<String>) {
@@ -197,5 +240,6 @@ fun IptvStorage.setSelection(context: Context, scope: String, label: String, ori
         if (!tmp.renameTo(f)) { f.delete(); tmp.renameTo(f) }
     }
     onSelectionChanged?.invoke(updated)
+    fireChange("selection")
     return true
 }

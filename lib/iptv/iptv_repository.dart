@@ -15,6 +15,7 @@ import 'services/channel_service.dart';
 import 'services/favorite_service.dart';
 import 'services/player_service.dart';
 import 'services/playback_controller.dart';
+import 'services/player_prefs_service.dart';
 import 'services/playlist_service.dart';
 import 'services/recently_watched_service.dart';
 import 'services/settings_service.dart';
@@ -50,6 +51,16 @@ class IPTVRepository extends ChangeNotifier {
   late final PlaybackController playback;
   late final AutomotiveStateSynchronizer automotive;
   final ParkedVideoService parked = ParkedVideoService();
+  final PlayerPrefsService prefs = PlayerPrefsService();
+
+  /// True when the video is rendered on the car display: the user chose "Android Auto" as the
+  /// output AND the platform confirms a car is connected. Otherwise the phone shows the video
+  /// (so a disconnected car never leaves the picture nowhere).
+  bool get videoOnCar {
+    if (prefs.output != VideoOutput.car) return false;
+    final l = automotive.connection.status;
+    return l != CarLinkStatus.disconnected && l != CarLinkStatus.checking;
+  }
 
   LoadState loadState = LoadState.idle;
   String? errorMessage;
@@ -78,6 +89,7 @@ class IPTVRepository extends ChangeNotifier {
     await settings.load();
     automotive.start();
     parked.start();
+    prefs.start();
     await favorites.load();
     await recents.reload();
     _dataSub = player.userDataChanges.listen((_) async {
@@ -149,6 +161,7 @@ class IPTVRepository extends ChangeNotifier {
     _dataSub?.cancel();
     automotive.dispose();
     parked.dispose();
+    prefs.dispose();
     playback.dispose();
     playlists.dispose();
     super.dispose();

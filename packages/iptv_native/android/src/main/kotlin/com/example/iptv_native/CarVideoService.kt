@@ -3,7 +3,13 @@ package com.example.iptv_native
 import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.ApplicationInfo
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.RectF
+import android.graphics.Typeface
 import android.net.Uri
 import android.os.Bundle
 import android.view.Surface
@@ -46,8 +52,15 @@ import androidx.media3.session.SessionToken
 /**
  * The app on the car display (Android Auto).
  *
+ * Screens: the home screen is the channel browser (All channels / Categories / Countries /
+ * Favorites / Recent / Playlists). Picking a channel opens the player screen; its list button
+ * returns to wherever the user was browsing, so another channel can be picked at any time.
+ *
  * Two jobs, both on top of the EXISTING ExoPlayer in [IptvPlaybackService] (no second player):
- *  1. Video: the host-owned car Surface is handed to the player ([IptvPlaybackService.setCarSurface]).
+ *  1. Output: if the user chose "Android Auto" as the video output (phone player screen), the
+ *     host-owned car Surface is handed to the player ([IptvPlaybackService.setCarSurface]).
+ *     If they chose "Phone", the car Surface shows only the channel artwork and controls and
+ *     the video stays on the phone. Both read the same shared setting ([IptvStorage.outputMode]).
  *  2. Channel browsing: a channel browser built from ListTemplate screens. It reads the very same
  *     MediaLibrarySession tree that Android Auto's media center uses (MediaBrowser.getChildren)
  *     and plays a picked channel through the same session (setMediaItem -> onSetMediaItems),
@@ -67,11 +80,15 @@ class CarVideoService : CarAppService() {
 private class CarVideoSession : Session() {
     private var browser: MediaBrowser? = null
     private var hostSurface: Surface? = null
+    private var surfaceW = 0
+    private var surfaceH = 0
     private var attached = false
     /** true = moving, false = stopped, null = unknown. */
     private var moving: Boolean? = null
     private var screen: VideoScreen? = null
     private var speedInfo: CarInfo? = null
+    private val browseScreens = mutableListOf<BrowseScreen>()
+    private val artwork = CarArtwork()
 
     private val speedListener = OnCarDataAvailableListener<Speed> { speed ->
         val v = speed.rawSpeedMetersPerSecond
@@ -82,7 +99,10 @@ private class CarVideoSession : Session() {
 
     private val surfaceCallback = object : SurfaceCallback {
         override fun onSurfaceAvailable(surfaceContainer: SurfaceContainer) {
+            if (attached) { IptvPlaybackService.clearCarSurface(); attached = false }
             hostSurface = surfaceContainer.surface
+            surfaceW = surfaceContainer.width
+            surfaceH = surfaceContainer.height
             sync()
         }
 
@@ -91,6 +111,9 @@ private class CarVideoSession : Session() {
             sync()
         }
     }
+
+    /** Shared setting: where video is rendered. Changes arrive from the phone UI in real time. */
+    private fun outputIsCar() = IptvStorage.outputMode(carContext) == IptvStorage.OUTPUT_CAR
 
     private fun videoAllowed(): Boolean = when (moving) {
         false -> true
@@ -102,19 +125,47 @@ private class CarVideoSession : Session() {
     private fun sync() {
         screen?.invalidate()
         val s = hostSurface
-        if (s != null && s.isValid && videoAllowed()) {
+        val valid = s != null && s.isValid
+        if (valid && outputIsCar() && videoAllowed()) {
             if (!attached) {
-                IptvPlaybackService.setCarSurface(s)
+                IptvPlaybackService.setCarSurface(s!!, surfaceW, surfaceH)
                 attached = true
             }
         } else if (attached) {
             IptvPlaybackService.clearCarSurface()
             attached = false
         }
+        if (!attached && valid) drawArtwork(s!!)
+    }
+
+    /** Artwork + channel name on the car surface while the video plays on the phone. */
+    private fun drawArtwork(s: Surface) {
+        val md = browser?.currentMediaItem?.mediaMetadata
+        val url = md?.artworkUri?.toString()
+        artwork.draw(
+            s,
+            md?.title?.toString() ?: "No channel playing",
+            md?.artist?.toString().orEmpty(),
+            url,
+        ) { ContextCompat.getMainExecutor(carContext).execute { hostSurface?.let { if (!attached && it.isValid) drawArtwork(it) } } }
     }
 
     private fun icon(res: Int) =
         CarIcon.Builder(IconCompat.createWithResource(carContext, res)).setTint(CarColor.DEFAULT).build()
+
+    /** Shared data changed (phone or car): settings re-route video, lists reload in place. */
+    private val changeListener: (String) -> Unit = { kind ->
+        ContextCompat.getMainExecutor(carContext).execute {
+            if (kind == "settings") {
+                IptvPlaybackService.setFill(IptvStorage.videoFit(carContext) == IptvStorage.FILL)
+                sync()
+            }
+            if (kind == "data" || kind == "settings") {
+                browseScreens.forEach { it.refresh() }
+                screen?.invalidate()
+            }
+        }
+    }
 
     override fun onCreateScreen(intent: Intent): Screen {
         val ctx = carContext
@@ -124,7 +175,10 @@ private class CarVideoSession : Session() {
         future.addListener({
             browser = try { future.get() } catch (_: Exception) { null }
             browser?.addListener(object : Player.Listener {
-                override fun onEvents(player: Player, events: Player.Events) { invalidateTop() }
+                override fun onEvents(player: Player, events: Player.Events) {
+                    invalidateTop()
+                    if (!attached) hostSurface?.takeIf { it.isValid }?.let { drawArtwork(it) }
+                }
             })
             sync()
             invalidateTop() // lists that were waiting for the connection can load now
@@ -140,8 +194,12 @@ private class CarVideoSession : Session() {
             info.addSpeedListener(ContextCompat.getMainExecutor(ctx), speedListener)
         } catch (_: Throwable) { moving = null }
 
+        IptvPlaybackService.setFill(IptvStorage.videoFit(ctx) == IptvStorage.FILL)
+        IptvStorage.addChangeListener(changeListener)
+
         lifecycle.addObserver(object : DefaultLifecycleObserver {
             override fun onDestroy(owner: LifecycleOwner) {
+                IptvStorage.removeChangeListener(changeListener)
                 try { speedInfo?.removeSpeedListener(speedListener) } catch (_: Throwable) {}
                 hostSurface = null
                 sync()
@@ -149,7 +207,8 @@ private class CarVideoSession : Session() {
                 browser = null
             }
         })
-        return VideoScreen(ctx).also { screen = it }
+        // Home screen = the channel browser itself.
+        return BrowseScreen(ctx, IptvPlaybackService.HOME, "IPTV", isRoot = true)
     }
 
     private fun invalidateTop() {
@@ -157,37 +216,48 @@ private class CarVideoSession : Session() {
         catch (_: Throwable) { screen?.invalidate() }
     }
 
-    // ---- Video screen ---------------------------------------------------------------
+    /** Opens the player screen, or returns to it if it is already in the stack. */
+    private fun openPlayer() {
+        val sm = carContext.getCarService(androidx.car.app.ScreenManager::class.java)
+        if (sm.screenStack.any { it.marker == PLAYER_MARKER }) sm.popTo(PLAYER_MARKER)
+        else sm.push(VideoScreen(carContext).also { it.marker = PLAYER_MARKER; screen = it })
+    }
+
+    // ---- Player screen --------------------------------------------------------------
 
     private inner class VideoScreen(ctx: CarContext) : Screen(ctx) {
-        /** What the user needs to know right now, or null when video is simply playing. */
+        /** What the user needs to know right now, or null when video / artwork is simply showing. */
         private fun message(): Pair<String, String>? {
             val c = browser ?: return "Connecting…" to "Starting the player"
             val name = c.currentMediaItem?.mediaMetadata?.title?.toString()
+            val onCar = outputIsCar()
             return when {
                 c.playerError != null ->
                     "Can't play ${name ?: "this channel"}" to
                         ((c.playerError?.errorCodeName ?: "Stream error") + " – try Next or pick another channel")
                 c.mediaItemCount == 0 ->
                     "No channel playing" to "Tap the list button to choose a channel"
-                moving == true -> "Video paused while driving" to "Audio keeps playing"
-                moving == null && !videoAllowed() -> "Video unavailable" to "Vehicle speed is not available – audio only"
+                onCar && moving == true -> "Video paused while driving" to "Audio keeps playing"
+                onCar && moving == null && !videoAllowed() -> "Video unavailable" to "Vehicle speed is not available – audio only"
                 c.playbackState == Player.STATE_BUFFERING -> "Buffering…" to (name ?: "")
                 else -> null
             }
         }
 
+        private fun currentChannelId() =
+            browser?.currentMediaItem?.mediaId?.let(IptvPlaybackService::parseChannelId)
+
         override fun onGetTemplate(): Template {
             fun action(res: Int, block: () -> Unit) =
                 Action.Builder().setIcon(icon(res)).setOnClickListener { block() }.build()
             val playing = browser?.playWhenReady == true
+            val fill = IptvStorage.videoFit(carContext) == IptvStorage.FILL
             val builder = NavigationTemplate.Builder()
                 .setBackgroundColor(CarColor.createCustom(Color.BLACK, Color.BLACK))
                 .setActionStrip(
                     ActionStrip.Builder()
-                        .addAction(action(R.drawable.ic_car_list) {
-                            screenManager.push(BrowseScreen(carContext, IptvPlaybackService.HOME, "IPTV"))
-                        })
+                        // Back to the channel list the user came from; pick another channel there.
+                        .addAction(action(R.drawable.ic_car_list) { screenManager.pop() })
                         .addAction(action(R.drawable.ic_car_prev) { browser?.seekToPreviousMediaItem() })
                         .addAction(action(if (playing) R.drawable.ic_car_pause else R.drawable.ic_car_play) {
                             browser?.let { if (it.playWhenReady) it.pause() else it.play() }
@@ -195,6 +265,18 @@ private class CarVideoSession : Session() {
                         .addAction(action(R.drawable.ic_car_next) { browser?.seekToNextMediaItem() })
                         .build()
                 )
+            val mapActions = ActionStrip.Builder()
+            // Shows the mode a tap switches to; the setting is shared with the phone player.
+            mapActions.addAction(action(if (fill) R.drawable.ic_car_fit else R.drawable.ic_car_fill) {
+                IptvStorage.setVideoFit(carContext, if (fill) IptvStorage.FIT else IptvStorage.FILL)
+            })
+            currentChannelId()?.let { id ->
+                val fav = IptvStorage.isFavorite(carContext, id)
+                mapActions.addAction(action(if (fav) R.drawable.ic_car_fav else R.drawable.ic_car_fav_border) {
+                    browser?.sendCustomCommand(SessionCommand(IptvPlaybackService.CMD_TOGGLE_FAVORITE, Bundle.EMPTY), Bundle.EMPTY)
+                })
+            }
+            builder.setMapActionStrip(mapActions.build())
             message()?.let { (title, text) ->
                 builder.setNavigationInfo(MessageInfo.Builder(title).setText(text).build())
             }
@@ -206,13 +288,15 @@ private class CarVideoSession : Session() {
 
     /**
      * One level of the MediaLibrarySession tree as a list. Folders open another BrowseScreen;
-     * a channel starts playing and returns to the video screen; rows for empty/info states
-     * are plain text. Long lists are paged to the host's list limit.
+     * a channel starts playing and opens the player screen; rows for empty/info states
+     * are plain text. Long lists are paged to the host's list limit. Lists reload in place
+     * when favorites / recents / the playlist change anywhere (see [changeListener]).
      */
     private inner class BrowseScreen(
         ctx: CarContext,
         private val parentId: String,
         private val title: String,
+        private val isRoot: Boolean = false,
     ) : Screen(ctx) {
         private var page = 0
         private var items: List<MediaItem>? = null
@@ -220,12 +304,23 @@ private class CarVideoSession : Session() {
         private var failed = false
         private var requested = false
 
+        init {
+            browseScreens.add(this)
+            lifecycle.addObserver(object : DefaultLifecycleObserver {
+                override fun onDestroy(owner: LifecycleOwner) { browseScreens.remove(this@BrowseScreen) }
+            })
+        }
+
+        // Reserve rows for "Now playing", the favorite toggle and "Next page".
         private val pageSize: Int = (try {
             ctx.getCarService(ConstraintManager::class.java)
                 .getContentLimit(ConstraintManager.CONTENT_LIMIT_TYPE_LIST)
-        } catch (_: Throwable) { 6 } - 2).coerceIn(4, 48) // room for the Previous/Next page rows
+        } catch (_: Throwable) { 6 } - 3).coerceIn(3, 48)
 
         private fun reload() { items = null; failed = false; requested = false; invalidate() }
+
+        /** Re-fetch but keep showing the current rows until the new ones arrive (no flicker). */
+        fun refresh() { requested = false; invalidate() }
 
         private fun load(b: MediaBrowser) {
             requested = true
@@ -255,12 +350,12 @@ private class CarVideoSession : Session() {
             b.setMediaItem(item.buildUpon().setUri(null as Uri?).build())
             b.prepare()
             b.play()
-            screenManager.popToRoot() // back to the video screen
+            openPlayer()
         }
 
         private fun toggleFavorite() {
+            // Stay on the list: it reloads itself through the shared change notification.
             browser?.sendCustomCommand(SessionCommand(IptvPlaybackService.CMD_TOGGLE_FAVORITE, Bundle.EMPTY), Bundle.EMPTY)
-            screenManager.popToRoot()
         }
 
         private fun row(item: MediaItem): Row {
@@ -281,24 +376,34 @@ private class CarVideoSession : Session() {
             val b = browser
             if (b != null && !requested) load(b)
             val list = items
+            val header = if (isRoot) Action.APP_ICON else Action.BACK
             if (failed) {
                 return MessageTemplate.Builder("Couldn't load this list")
                     .setTitle(title)
-                    .setHeaderAction(Action.BACK)
+                    .setHeaderAction(header)
                     .addAction(Action.Builder().setTitle("Retry").setOnClickListener { reload() }.build())
                     .build()
             }
             if (list == null) {
-                return ListTemplate.Builder().setTitle(title).setHeaderAction(Action.BACK).setLoading(true).build()
+                return ListTemplate.Builder().setTitle(title).setHeaderAction(header).setLoading(true).build()
             }
             val lb = ItemList.Builder()
-            // At the top level, one tap adds/removes the playing channel from Favorites.
+            // At the top level: jump back to the player, and one tap adds/removes the playing
+            // channel from Favorites.
             if (parentId == IptvPlaybackService.HOME && page == 0) {
                 val cur = b?.currentMediaItem
                 val id = cur?.mediaId?.let(IptvPlaybackService::parseChannelId)
                 if (id != null) {
-                    val fav = IptvStorage.isFavorite(carContext, id)
                     val name = cur.mediaMetadata.title?.toString() ?: "channel"
+                    lb.addItem(
+                        Row.Builder()
+                            .setTitle("Now playing")
+                            .addText(name)
+                            .setBrowsable(true)
+                            .setOnClickListener { openPlayer() }
+                            .build()
+                    )
+                    val fav = IptvStorage.isFavorite(carContext, id)
                     lb.addItem(
                         Row.Builder()
                             .setTitle(if (fav) "Remove from Favorites" else "Add to Favorites")
@@ -319,9 +424,94 @@ private class CarVideoSession : Session() {
             }
             return ListTemplate.Builder()
                 .setTitle(if (page > 0) "$title · ${page + 1}" else title)
-                .setHeaderAction(Action.BACK)
+                .setHeaderAction(header)
                 .setSingleList(lb.build())
                 .build()
         }
+    }
+
+    private companion object {
+        const val PLAYER_MARKER = "player"
+    }
+}
+
+/**
+ * Draws the channel artwork and name onto the car Surface (used when the video plays on the
+ * phone). Logos are fetched once, off the main thread, and cached.
+ */
+private class CarArtwork {
+    private val cache = android.util.LruCache<String, Bitmap>(8)
+    private val loading = HashSet<String>()
+    private val failed = HashSet<String>()
+
+    fun draw(surface: Surface, title: String, subtitle: String, url: String?, onLoaded: () -> Unit) {
+        var bmp: Bitmap? = null
+        if (!url.isNullOrBlank() && url.startsWith("http")) {
+            bmp = cache.get(url)
+            if (bmp == null) fetch(url, onLoaded)
+        }
+        val canvas: Canvas = try { surface.lockCanvas(null) } catch (_: Throwable) { return }
+        try {
+            canvas.drawColor(Color.BLACK)
+            val w = canvas.width.toFloat()
+            val h = canvas.height.toFloat()
+            val box = minOf(w, h) * 0.42f
+            val cx = w / 2
+            val top = h * 0.14f
+            val dest = RectF(cx - box / 2, top, cx + box / 2, top + box)
+            val bg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF263238.toInt() }
+            canvas.drawRoundRect(dest, box * 0.08f, box * 0.08f, bg)
+            if (bmp != null) {
+                // Fit the logo inside the tile, keeping its aspect ratio.
+                val scale = minOf(dest.width() * 0.84f / bmp.width, dest.height() * 0.84f / bmp.height)
+                val bw = bmp.width * scale
+                val bh = bmp.height * scale
+                canvas.drawBitmap(
+                    bmp, null,
+                    RectF(cx - bw / 2, dest.centerY() - bh / 2, cx + bw / 2, dest.centerY() + bh / 2),
+                    Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG),
+                )
+            } else {
+                val initial = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = Color.WHITE; textSize = box * 0.45f; textAlign = Paint.Align.CENTER
+                }
+                val ch = title.trim().firstOrNull()?.uppercaseChar()?.toString() ?: "TV"
+                canvas.drawText(ch, cx, dest.centerY() + initial.textSize * 0.35f, initial)
+            }
+            val titlePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE; textSize = h * 0.075f; textAlign = Paint.Align.CENTER
+                typeface = Typeface.DEFAULT_BOLD
+            }
+            val ty = dest.bottom + titlePaint.textSize * 1.4f
+            canvas.drawText(ellipsize(title, titlePaint, w * 0.8f), cx, ty, titlePaint)
+            if (subtitle.isNotBlank()) {
+                val sub = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = 0xFFB0BEC5.toInt(); textSize = h * 0.05f; textAlign = Paint.Align.CENTER
+                }
+                canvas.drawText(ellipsize(subtitle, sub, w * 0.8f), cx, ty + sub.textSize * 1.5f, sub)
+            }
+        } finally {
+            try { surface.unlockCanvasAndPost(canvas) } catch (_: Throwable) {}
+        }
+    }
+
+    private fun ellipsize(t: String, p: Paint, max: Float): String =
+        android.text.TextUtils.ellipsize(t, android.text.TextPaint(p), max, android.text.TextUtils.TruncateAt.END).toString()
+
+    private fun fetch(url: String, onLoaded: () -> Unit) {
+        synchronized(loading) { if (url in failed || !loading.add(url)) return }
+        Thread {
+            try {
+                val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+                conn.connectTimeout = 8_000
+                conn.readTimeout = 8_000
+                val bmp = conn.inputStream.use { BitmapFactory.decodeStream(it) }
+                if (bmp != null) { cache.put(url, bmp); onLoaded() } else synchronized(loading) { failed.add(url) }
+            } catch (_: Throwable) {
+                synchronized(loading) { failed.add(url) }
+            } finally {
+                synchronized(loading) { loading.remove(url) }
+            }
+        }.start()
     }
 }

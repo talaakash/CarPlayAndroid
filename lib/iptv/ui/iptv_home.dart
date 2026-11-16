@@ -1,22 +1,19 @@
 import 'dart:async';
 
-import 'package:iptv_native/iptv_native.dart' show CommandOrigin;
 import 'package:material_ui/material_ui.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 
-import '../automotive/car_connection_service.dart';
 import '../core/channel.dart';
 import '../iptv_repository.dart';
 import '../widgets/channel_tile.dart';
 import '../widgets/filter_sheet.dart';
 import 'settings_screen.dart';
-import 'video_view.dart';
 
 enum _View { all, favorites, recents, group }
 
-/// The complete IPTV experience, embedded directly in the Home Screen:
-/// now playing (inline video + controls), categories, search, channel list.
-/// All state comes from [IPTVRepository], i.e. the same native player Android Auto uses.
+/// The channel browser shown on the Home Screen: categories, search, channel list.
+/// Playback lives in the mini-player (bottom) and the full-screen player. All state comes
+/// from [IPTVRepository], i.e. the same native player and library Android Auto uses.
 class IptvHomeBody extends StatefulWidget {
   const IptvHomeBody({super.key, required this.repo});
   final IPTVRepository repo;
@@ -32,7 +29,6 @@ class _IptvHomeBodyState extends State<IptvHomeBody> {
   Timer? _debounce;
   Set<String> _groups = {};
   Set<String> _countries = {};
-  bool _pipSupported = false;
   bool? _lastPlaying;
 
   IPTVRepository get repo => widget.repo;
@@ -43,9 +39,6 @@ class _IptvHomeBodyState extends State<IptvHomeBody> {
     repo.playback.addListener(_onPlayback);
     repo.settings.addListener(_onPlayback);
     repo.automotive.navigation.remoteSelection.addListener(_onRemoteSelection);
-    repo.player.pipSupported().then((v) {
-      if (mounted) setState(() => _pipSupported = v);
-    }).catchError((_) {});
   }
 
   @override
@@ -54,7 +47,6 @@ class _IptvHomeBodyState extends State<IptvHomeBody> {
     repo.settings.removeListener(_onPlayback);
     repo.automotive.navigation.remoteSelection.removeListener(_onRemoteSelection);
     _debounce?.cancel();
-    repo.player.setAutoPip(false).catchError((_) {});
     WakelockPlus.disable();
     super.dispose();
   }
@@ -95,7 +87,8 @@ class _IptvHomeBodyState extends State<IptvHomeBody> {
     repo.automotive.navigation.selectFromPhone(scope, label).catchError((Object _) {});
   }
 
-  /// Keep the screen on / auto-PiP only while a stream is actually playing.
+  /// Keep the screen on only while a stream is actually playing (auto-PiP is handled by the
+  /// full-screen player, the only place the video is visible).
   void _onPlayback() {
     final playing = repo.playback.isPlaying;
     if (playing == _lastPlaying) return;
@@ -105,7 +98,6 @@ class _IptvHomeBodyState extends State<IptvHomeBody> {
     } else {
       WakelockPlus.disable();
     }
-    repo.player.setAutoPip(playing && repo.settings.autoPip).catchError((_) {});
   }
 
   List<Channel> get _visible {
@@ -152,7 +144,7 @@ class _IptvHomeBodyState extends State<IptvHomeBody> {
   @override
   Widget build(BuildContext context) {
     return ListenableBuilder(
-      listenable: Listenable.merge([repo, repo.playback, repo.favorites, repo.recents, repo.automotive, repo.parked]),
+      listenable: Listenable.merge([repo, repo.playback, repo.favorites, repo.recents]),
       builder: (context, _) {
         return Column(children: [
           if (repo.loadState == LoadState.loading) const LinearProgressIndicator(),
@@ -161,8 +153,6 @@ class _IptvHomeBodyState extends State<IptvHomeBody> {
               content: Text(repo.staleWarning!),
               actions: [TextButton(onPressed: () => repo.refresh(force: true), child: const Text('Retry'))],
             ),
-          CarLinkPanel(repo: repo),
-          NowPlayingCard(repo: repo, pipSupported: _pipSupported),
           _categoryChips(),
           _searchRow(),
           Expanded(child: _channels()),
@@ -295,139 +285,6 @@ class _IptvHomeBodyState extends State<IptvHomeBody> {
   }
 }
 
-/// Currently playing channel: inline video, status and controls.
-class NowPlayingCard extends StatelessWidget {
-  const NowPlayingCard({super.key, required this.repo, required this.pipSupported});
-  final IPTVRepository repo;
-  final bool pipSupported;
-
-  @override
-  Widget build(BuildContext context) {
-    final pc = repo.playback;
-    final ch = pc.current;
-    final st = pc.state;
-    final theme = Theme.of(context);
-    final parked = repo.parked.info;
-    // Car displays: 64 dp targets with 24 dp spacing; phones keep the compact layout.
-    final big = parked.automotive;
-    final target = big ? 64.0 : 48.0;
-    final gap = big ? 24.0 : 8.0;
-    ButtonStyle? sized() => big ? IconButton.styleFrom(minimumSize: Size(target, target)) : null;
-
-    if (ch == null || !pc.hasMedia) {
-      return Card(
-        margin: const EdgeInsets.fromLTRB(12, 8, 12, 4),
-        child: const ListTile(
-          leading: Icon(Icons.play_circle_outline, size: 36),
-          title: Text('Nothing playing'),
-          subtitle: Text('Pick a channel below to start watching.'),
-        ),
-      );
-    }
-
-    final status = pc.hasError
-        ? 'Playback error'
-        : pc.isBuffering
-            ? 'Buffering…'
-            : pc.isPlaying
-                ? 'Live'
-                : 'Paused';
-
-    return Card(
-      margin: const EdgeInsets.fromLTRB(12, 8, 12, 4),
-      clipBehavior: Clip.antiAlias,
-      child: Column(mainAxisSize: MainAxisSize.min, children: [
-        if (!parked.videoAllowed)
-          AspectRatio(
-            aspectRatio: 16 / 9,
-            child: ColoredBox(
-              color: Colors.black,
-              child: Center(
-                child: Column(mainAxisSize: MainAxisSize.min, children: [
-                  const Icon(Icons.headphones, color: Colors.white70, size: 44),
-                  const SizedBox(height: 8),
-                  Text(
-                    parked.playbackBlocked
-                        ? 'Playback paused while driving'
-                        : 'Audio only while driving',
-                    style: const TextStyle(color: Colors.white70),
-                  ),
-                  const Text('Video returns when the vehicle is parked.',
-                      style: TextStyle(color: Colors.white38, fontSize: 12)),
-                ]),
-              ),
-            ),
-          )
-        else if (st.inPictureInPicture)
-          const AspectRatio(aspectRatio: 16 / 9, child: ColoredBox(color: Colors.black, child: NativeVideoView()))
-        else
-          AspectRatio(
-            aspectRatio: 16 / 9,
-            child: Stack(fit: StackFit.expand, children: [
-              const ColoredBox(color: Colors.black, child: NativeVideoView()),
-              if (pc.isBuffering) const Center(child: CircularProgressIndicator(color: Colors.white)),
-              if (pc.hasError)
-                ColoredBox(
-                  color: Colors.black54,
-                  child: Center(
-                    child: Column(mainAxisSize: MainAxisSize.min, children: [
-                      const Icon(Icons.error_outline, color: Colors.redAccent, size: 40),
-                      const Text('This channel cannot be played right now.', style: TextStyle(color: Colors.white70)),
-                      TextButton(onPressed: pc.retry, child: const Text('Retry')),
-                    ]),
-                  ),
-                ),
-              if (pipSupported)
-                Positioned(
-                  top: 4,
-                  right: 4,
-                  child: IconButton(
-                    tooltip: 'Picture in picture',
-                    color: Colors.white,
-                    icon: const Icon(Icons.picture_in_picture_alt),
-                    onPressed: repo.player.enterPip,
-                  ),
-                ),
-            ]),
-          ),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-          child: Row(children: [
-            ChannelLogo(url: ch.logo, size: 44),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                Text(ch.name, maxLines: 1, overflow: TextOverflow.ellipsis, style: theme.textTheme.titleMedium),
-                Text('$status · ${ch.group}', maxLines: 1, overflow: TextOverflow.ellipsis, style: theme.textTheme.bodySmall),
-              ]),
-            ),
-            IconButton(
-              tooltip: 'Favorite',
-              icon: Icon(repo.favorites.isFavorite(ch.id) ? Icons.favorite : Icons.favorite_border),
-              onPressed: () => repo.toggleFavorite(ch),
-            ),
-          ]),
-        ),
-        Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-          IconButton(iconSize: big ? 40 : 32, style: sized(), tooltip: 'Previous channel', icon: const Icon(Icons.skip_previous), onPressed: pc.previous),
-          SizedBox(width: gap),
-          IconButton.filled(
-            iconSize: big ? 40 : 34,
-            style: sized(),
-            tooltip: pc.isPlaying ? 'Pause' : 'Play',
-            icon: Icon(pc.isPlaying ? Icons.pause : Icons.play_arrow),
-            // Driving without background audio: play/pause is withdrawn natively too.
-            onPressed: parked.playbackBlocked ? null : pc.togglePlay,
-          ),
-          SizedBox(width: gap),
-          IconButton(iconSize: big ? 40 : 32, style: sized(), tooltip: 'Next channel', icon: const Icon(Icons.skip_next), onPressed: pc.next),
-        ]),
-        const SizedBox(height: 4),
-      ]),
-    );
-  }
-}
-
 /// App bar actions: playlist selection, refresh, settings.
 List<Widget> iptvAppBarActions(BuildContext context, IPTVRepository repo) {
   final s = repo.settings;
@@ -464,83 +321,5 @@ String iptvStatusLine(IPTVRepository repo) {
       return '${repo.settings.activePlaylist.name} · ${repo.channels.all.length} channels';
     case LoadState.idle:
       return 'Starting…';
-  }
-}
-
-
-/// Connected-car panel: platform-confirmed connection status, who last controlled playback,
-/// and honest information about what the car display can and cannot show.
-class CarLinkPanel extends StatelessWidget {
-  const CarLinkPanel({super.key, required this.repo});
-  final IPTVRepository repo;
-
-  @override
-  Widget build(BuildContext context) {
-    final snap = repo.automotive.snapshot;
-    final scheme = Theme.of(context).colorScheme;
-    final connected = snap.link != CarLinkStatus.disconnected && snap.link != CarLinkStatus.checking;
-
-    final (label, icon) = switch (snap.link) {
-      CarLinkStatus.checking => ('Checking car connection…', Icons.sync),
-      CarLinkStatus.disconnected => ('Not connected to a car', Icons.directions_car_outlined),
-      CarLinkStatus.androidAuto => ('Connected to Android Auto', Icons.directions_car),
-      CarLinkStatus.androidAutomotive => ('Connected to Android Automotive', Icons.directions_car),
-      CarLinkStatus.carPlay => ('Connected to CarPlay', Icons.directions_car),
-    };
-
-    final origin = switch (snap.origin) {
-      CommandOrigin.phone => 'this phone',
-      CommandOrigin.car => 'the car',
-      CommandOrigin.system => 'system controls (notification, Bluetooth, steering wheel)',
-    };
-
-    return Card(
-      margin: const EdgeInsets.fromLTRB(12, 8, 12, 0),
-      color: connected ? scheme.primaryContainer : null,
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(12, 8, 4, 8),
-        child: Row(children: [
-          Icon(icon, color: connected ? scheme.onPrimaryContainer : null),
-          const SizedBox(width: 12),
-          Expanded(
-            child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Text(label, style: Theme.of(context).textTheme.titleSmall),
-              Text(
-                connected
-                    ? 'Car shows: ${snap.channelName ?? 'no channel yet'} · last control from $origin'
-                    : snap.channelId != null
-                        ? 'Not connected to a car · last control from $origin'
-                        : 'Controls here work either way. Plug in or pair a car to sync them.',
-                style: Theme.of(context).textTheme.bodySmall,
-              ),
-            ]),
-          ),
-          if (connected && snap.channelId != null)
-            TextButton(onPressed: repo.automotive.bridge.stop, child: const Text('Stop')),
-          IconButton(
-            tooltip: 'What can the car display show?',
-            icon: const Icon(Icons.info_outline),
-            onPressed: () => showDialog<void>(
-              context: context,
-              builder: (_) => AlertDialog(
-                title: const Text('Phone and car'),
-                content: const Text(
-                  'The car shows a native, synchronized interface (channel list, categories, favorites, '
-                  'recent, now playing with controls). Channel, play/pause, next/previous and category '
-                  'changes made on either side are shared.\n\n'
-                  'Video on the car screen is decided by the car and the system, not by this app. '
-                  'On Android Auto it needs Google\'s parked video category (a beta: Android 17 phone, '
-                  'compatible vehicle, early-access approval) and it only plays while parked. '
-                  'On CarPlay it needs Apple\'s video entitlement and a supporting vehicle. '
-                  'Otherwise the car plays audio only and video stays on the phone. The connection '
-                  'status above is reported by Android / iOS and cannot be ended from the app.',
-                ),
-                actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('OK'))],
-              ),
-            ),
-          ),
-        ]),
-      ),
-    );
   }
 }

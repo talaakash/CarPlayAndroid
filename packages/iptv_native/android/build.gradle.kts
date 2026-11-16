@@ -84,6 +84,8 @@ dependencies {
     api("androidx.media3:media3-exoplayer-smoothstreaming:$media3")
     api("androidx.media3:media3-exoplayer-rtsp:$media3")
     api("androidx.media3:media3-session:$media3")
+    // Presentation effect: letterbox (Fit) / crop (Fill) on the car Surface, which cannot scale by itself.
+    implementation("androidx.media3:media3-effect:$media3")
     implementation("com.google.guava:guava:33.4.8-android")
     implementation("androidx.core:core:1.16.0")
     // CarConnection: platform-confirmed Android Auto / Automotive OS connection state.
