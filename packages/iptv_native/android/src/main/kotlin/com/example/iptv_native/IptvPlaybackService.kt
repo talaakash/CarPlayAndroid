@@ -100,6 +100,8 @@ class IptvPlaybackService : MediaLibraryService() {
                 }
             }
 
+            override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) = pushVideoSize()
+
             override fun onPlayerError(error: PlaybackException) = handleError(error)
         })
 
@@ -119,6 +121,15 @@ class IptvPlaybackService : MediaLibraryService() {
         registerNetworkCallback()
         ParkedVideoPolicy.addListener(policyListener)
         applyParkedPolicy()
+    }
+
+    /** Feeds the video's real aspect (with pixel ratio) to the car renderer for Fit / Fill. */
+    private fun pushVideoSize() {
+        val v = player.videoSize
+        carRenderer?.setVideoSize(
+            if (v.height > 0) v.width * v.pixelWidthHeightRatio else 0f,
+            v.height.toFloat(),
+        )
     }
 
     private var pausedByPolicy = false
@@ -148,31 +159,12 @@ class IptvPlaybackService : MediaLibraryService() {
         }
     }
 
-    /**
-     * The car Surface stretches whatever the codec produces, so Fit / Fill is done with a
-     * Presentation effect that renders into a frame of the surface's aspect ratio (bars for
-     * Fit, crop for Fill). Effects are active only while the car owns the output; the phone
-     * view keeps the untouched stream and is scaled in Flutter.
-     */
-    @androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
-    private fun applyVideoLayout() {
-        main.post {
-            val w = carWidth
-            val h = carHeight
-            val effects = if (carSurface != null && w > 0 && h > 0) {
-                val layout = if (fillMode) androidx.media3.effect.Presentation.LAYOUT_SCALE_TO_FIT_WITH_CROP
-                else androidx.media3.effect.Presentation.LAYOUT_SCALE_TO_FIT
-                listOf<androidx.media3.common.Effect>(
-                    androidx.media3.effect.Presentation.createForAspectRatio(w.toFloat() / h, layout)
-                )
-            } else emptyList()
-            try { player.setVideoEffects(effects) } catch (_: Throwable) { /* unsupported device: stretched video */ }
-        }
-    }
-
     private fun applyCarSurface() {
         val s = carSurface ?: return
-        if (s.isValid) player.setVideoSurface(s) // raw ExoPlayer: bypasses the phone guard
+        if (s.isValid) {
+            player.setVideoSurface(s) // raw ExoPlayer: bypasses the phone guard
+            pushVideoSize()
+        }
     }
 
     // ---- Favorite button (car + notification) ---------------------------------------
@@ -780,31 +772,34 @@ class IptvPlaybackService : MediaLibraryService() {
         @Volatile
         var onCarSurfaceCleared: (() -> Unit)? = null
 
-        /** Pixel size of the car Surface (0 = unknown) and the current Fit / Fill mode. */
-        @Volatile private var carWidth = 0
-        @Volatile private var carHeight = 0
+        /** Draws the shared player onto the car Surface with Fit / Fill (see [CarVideoRenderer]). */
+        @Volatile private var carRenderer: CarVideoRenderer? = null
         @Volatile private var fillMode = false
 
         fun setCarSurface(surface: android.view.Surface, width: Int = 0, height: Int = 0) {
-            carSurface = surface
-            carWidth = width
-            carHeight = height
+            carRenderer?.release()
+            val r = CarVideoRenderer(surface).also { it.setFill(fillMode) }
+            val input = r.inputSurface
+            if (input == null) { r.release(); carRenderer = null; carSurface = null; return }
+            carRenderer = r
+            carSurface = input
             instance?.applyCarSurface()
-            instance?.applyVideoLayout()
         }
 
         fun clearCarSurface() {
             val old = carSurface ?: return
+            val r = carRenderer
             carSurface = null
+            carRenderer = null
             instance?.player?.clearVideoSurface(old)
-            instance?.applyVideoLayout()
+            r?.release()
             onCarSurfaceCleared?.invoke()
         }
 
-        /** Fit (letterbox) / Fill (crop) for the car video. The phone scales in Flutter. */
+        /** Fit (letterbox) / Fill (crop) for the car video. The phone view scales itself. */
         fun setFill(fill: Boolean) {
             fillMode = fill
-            instance?.applyVideoLayout()
+            carRenderer?.setFill(fill)
         }
 
         /** mediaId format: ch|<scope>|<channelId>. */

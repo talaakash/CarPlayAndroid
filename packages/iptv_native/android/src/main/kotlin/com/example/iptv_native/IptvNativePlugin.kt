@@ -143,6 +143,26 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
         }, ContextCompat.getMainExecutor(appContext))
     }
 
+    /**
+     * Fit / Fill applied to the real video surface: the TextureView always matches the stage,
+     * and its content transform shrinks (Fit: whole picture, bars) or grows (Fill: cover, crop
+     * the overflow) the picture while keeping its aspect ratio.
+     */
+    private fun applyFit() {
+        val tv = videoView ?: return
+        val w = tv.width.toFloat()
+        val h = tv.height.toFloat()
+        if (w <= 0f || h <= 0f || videoSize.width <= 0 || videoSize.height <= 0) { tv.setTransform(null); return }
+        val va = videoSize.width * videoSize.pixelWidthHeightRatio / videoSize.height
+        val sa = w / h
+        val fill = IptvStorage.videoFit(appContext) == IptvStorage.FILL
+        val sx: Float
+        val sy: Float
+        if (!fill) { sx = if (va > sa) 1f else va / sa; sy = if (va > sa) sa / va else 1f }
+        else { sx = if (va > sa) va / sa else 1f; sy = if (va > sa) 1f else sa / va }
+        tv.setTransform(android.graphics.Matrix().apply { setScale(sx, sy, w / 2f, h / 2f) })
+    }
+
     /** The car released the output Surface: give the video back to the phone's TextureView. */
     private fun reattachPhoneVideo() {
         val c = controller ?: return
@@ -157,6 +177,7 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
 
     override fun onVideoSizeChanged(size: VideoSize) {
         videoSize = size
+        applyFit()
         emitState()
     }
 
@@ -182,7 +203,8 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
             "status" to status,
             "isPlaying" to (c?.isPlaying ?: false),
             "error" to err?.let { "${it.errorCodeName}: ${it.message ?: ""}" },
-            "videoWidth" to videoSize.width,
+            // Pixel aspect ratio applied, so Dart sees the displayed shape.
+            "videoWidth" to (videoSize.width * videoSize.pixelWidthHeightRatio).toInt(),
             "videoHeight" to videoSize.height,
             "pip" to inPip,
             "version" to ++stateVersion,
@@ -214,6 +236,7 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
     private val changeListener: (String) -> Unit = { kind ->
         if (kind == "settings") main.post {
             IptvPlaybackService.setFill(IptvStorage.videoFit(appContext) == IptvStorage.FILL)
+            applyFit()
             emit(settingsMap())
         }
     }
@@ -388,11 +411,17 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
 
     private inner class VideoViewFactory : PlatformViewFactory(StandardMessageCodec.INSTANCE) {
         override fun create(context: Context, viewId: Int, args: Any?): PlatformView {
-            val tv = TextureView(context)
+            val tv = object : TextureView(context) {
+                override fun onSizeChanged(w: Int, h: Int, ow: Int, oh: Int) {
+                    super.onSizeChanged(w, h, ow, oh)
+                    applyFit()
+                }
+            }
             return object : PlatformView {
                 init {
                     videoView = tv
                     controller?.setVideoTextureView(tv)
+                    applyFit()
                 }
                 override fun getView(): View = tv
                 override fun dispose() {

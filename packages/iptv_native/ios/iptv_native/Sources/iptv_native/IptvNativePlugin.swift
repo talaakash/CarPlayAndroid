@@ -95,7 +95,10 @@ public final class IptvNativePlugin: NSObject, FlutterPlugin, FlutterStreamHandl
                     "fit": UserDefaults.standard.string(forKey: "iptv.fit") ?? "fit"])
         // iOS: the preference is stored and mirrored in Flutter; CarPlay video routing is system-decided.
         case "setOutput": UserDefaults.standard.set(args?["output"] as? String ?? "phone", forKey: "iptv.output"); result(nil)
-        case "setFit": UserDefaults.standard.set(args?["fit"] as? String ?? "fit", forKey: "iptv.fit"); result(nil)
+        case "setFit":
+            UserDefaults.standard.set(args?["fit"] as? String ?? "fit", forKey: "iptv.fit")
+            IptvVideoView.active?.applyFit()
+            result(nil)
         case "connection": result(connectionMap())
         case "selection": result(selectionMap(IptvStorage.shared.selection()))
         case "setSelection":
@@ -144,7 +147,7 @@ final class IptvVideoView: UIView, AVPictureInPictureControllerDelegate {
         super.init(frame: frame)
         backgroundColor = .black
         playerLayer.player = IptvPlayerCore.shared.player
-        playerLayer.videoGravity = .resizeAspect
+        applyFit()
         if AVPictureInPictureController.isPictureInPictureSupported() {
             pip = AVPictureInPictureController(playerLayer: playerLayer)
             pip?.delegate = self
@@ -159,6 +162,11 @@ final class IptvVideoView: UIView, AVPictureInPictureControllerDelegate {
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    /// Fit = whole picture (aspect kept), Fill = cover and crop (aspect kept).
+    func applyFit() {
+        playerLayer.videoGravity = UserDefaults.standard.string(forKey: "iptv.fit") == "fill" ? .resizeAspectFill : .resizeAspect
+    }
 
     deinit {
         NotificationCenter.default.removeObserver(self)

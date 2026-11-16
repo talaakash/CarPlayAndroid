@@ -141,30 +141,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
       );
     }
     final fill = repo.prefs.fit == VideoFit.fill;
-    final ratio = pc.state.aspectRatio;
     return ColoredBox(
       color: Colors.black,
       child: Stack(fit: StackFit.expand, children: [
-        LayoutBuilder(builder: (context, box) {
-          final boxRatio = box.maxWidth / box.maxHeight;
-          // Fit: the whole picture, bars where needed. Fill: cover the area, crop the overflow.
-          final wide = ratio > boxRatio;
-          final double vw, vh;
-          if (fill == wide) {
-            vh = box.maxHeight;
-            vw = vh * ratio;
-          } else {
-            vw = box.maxWidth;
-            vh = vw / ratio;
-          }
-          return ClipRect(
-            child: OverflowBox(
-              maxWidth: vw,
-              maxHeight: vh,
-              child: SizedBox(width: vw, height: vh, child: const NativeVideoView()),
-            ),
-          );
-        }),
+        // Fit / Fill is applied natively to the video surface itself (see IptvNativePlugin.applyFit),
+        // so the view simply fills the stage.
+        const NativeVideoView(),
         if (pc.isBuffering) const Center(child: CircularProgressIndicator(color: Colors.white)),
         if (pc.hasError)
           ColoredBox(
@@ -204,22 +186,30 @@ class _PlayerScreenState extends State<PlayerScreen> {
   Widget _artworkStage(String title, String subtitle, {required IconData icon, bool logo = true}) {
     final ch = repo.playback.current;
     final pc = repo.playback;
+    // FittedBox scales the content down when the stage is short (small phones, landscape),
+    // so it can never overflow.
     return ColoredBox(
       color: Colors.black,
       child: Center(
         child: Padding(
           padding: const EdgeInsets.all(12),
-          child: Column(mainAxisSize: MainAxisSize.min, children: [
-            if (logo && ch != null)
-              Hero(tag: PlayerScreen.artworkHero, child: ChannelLogo(url: ch.logo, size: 96))
-            else
-              Icon(icon, color: Colors.white70, size: 56),
-            const SizedBox(height: 10),
-            Text(title, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
-            const SizedBox(height: 2),
-            Text(subtitle, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white54, fontSize: 12)),
-            if (pc.hasError) TextButton(onPressed: pc.retry, child: const Text('Retry')),
-          ]),
+          child: FittedBox(
+            fit: BoxFit.scaleDown,
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 320),
+              child: Column(mainAxisSize: MainAxisSize.min, children: [
+                if (logo && ch != null)
+                  Hero(tag: PlayerScreen.artworkHero, child: ChannelLogo(url: ch.logo, size: 96))
+                else
+                  Icon(icon, color: Colors.white70, size: 56),
+                const SizedBox(height: 10),
+                Text(title, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+                const SizedBox(height: 2),
+                Text(subtitle, textAlign: TextAlign.center, style: const TextStyle(color: Colors.white54, fontSize: 12)),
+                if (pc.hasError) TextButton(onPressed: pc.retry, child: const Text('Retry')),
+              ]),
+            ),
+          ),
         ),
       ),
     );
