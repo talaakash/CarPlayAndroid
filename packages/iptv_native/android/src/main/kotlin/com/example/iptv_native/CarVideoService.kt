@@ -79,9 +79,8 @@ class CarVideoService : CarAppService() {
 
 private class CarVideoSession : Session() {
     private var browser: MediaBrowser? = null
-    private var hostSurface: Surface? = null
-    private var surfaceW = 0
-    private var surfaceH = 0
+    /** GL owner of the host Surface (video and artwork both go through it). */
+    private var renderer: CarVideoRenderer? = null
     private var attached = false
     /** true = moving, false = stopped, null = unknown. */
     private var moving: Boolean? = null
@@ -99,17 +98,21 @@ private class CarVideoSession : Session() {
 
     private val surfaceCallback = object : SurfaceCallback {
         override fun onSurfaceAvailable(surfaceContainer: SurfaceContainer) {
-            if (attached) { IptvPlaybackService.clearCarSurface(); attached = false }
-            hostSurface = surfaceContainer.surface
-            surfaceW = surfaceContainer.width
-            surfaceH = surfaceContainer.height
+            dropRenderer()
+            surfaceContainer.surface?.let { renderer = CarVideoRenderer(it).takeIf { r -> r.inputSurface != null } }
             sync()
         }
 
         override fun onSurfaceDestroyed(surfaceContainer: SurfaceContainer) {
-            hostSurface = null
+            dropRenderer()
             sync()
         }
+    }
+
+    private fun dropRenderer() {
+        if (attached) { IptvPlaybackService.clearCarSurface(); attached = false }
+        renderer?.release()
+        renderer = null
     }
 
     /** Shared setting: where video is rendered. Changes arrive from the phone UI in real time. */
@@ -121,33 +124,34 @@ private class CarVideoSession : Session() {
         null -> carContext.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
     }
 
-    /** Single place that decides whether the car surface is attached to the player. */
+    /** Single place that decides whether the car renders the video or the artwork. */
     private fun sync() {
         screen?.invalidate()
-        val s = hostSurface
-        val valid = s != null && s.isValid
-        if (valid && outputIsCar() && videoAllowed()) {
+        val r = renderer
+        if (r != null && outputIsCar() && videoAllowed()) {
             if (!attached) {
-                IptvPlaybackService.setCarSurface(s!!, surfaceW, surfaceH)
+                // Same Surface, same renderer: only the player's output changes, nothing else.
+                IptvPlaybackService.setCarSurface(r)
                 attached = true
             }
         } else if (attached) {
             IptvPlaybackService.clearCarSurface()
             attached = false
         }
-        if (!attached && valid) drawArtwork(s!!)
+        if (!attached && r != null) drawArtwork(r)
     }
 
     /** Artwork + channel name on the car surface while the video plays on the phone. */
-    private fun drawArtwork(s: Surface) {
+    private fun drawArtwork(r: CarVideoRenderer) {
         val md = browser?.currentMediaItem?.mediaMetadata
         val url = md?.artworkUri?.toString()
-        artwork.draw(
-            s,
+        artwork.render(
+            r.width, r.height,
             md?.title?.toString() ?: "No channel playing",
             md?.artist?.toString().orEmpty(),
             url,
-        ) { ContextCompat.getMainExecutor(carContext).execute { hostSurface?.let { if (!attached && it.isValid) drawArtwork(it) } } }
+            onLoaded = { ContextCompat.getMainExecutor(carContext).execute { renderer?.let { if (!attached) drawArtwork(it) } } },
+        )?.let { r.showArtwork(it) }
     }
 
     private fun icon(res: Int) =
@@ -177,7 +181,7 @@ private class CarVideoSession : Session() {
             browser?.addListener(object : Player.Listener {
                 override fun onEvents(player: Player, events: Player.Events) {
                     invalidateTop()
-                    if (!attached) hostSurface?.takeIf { it.isValid }?.let { drawArtwork(it) }
+                    if (!attached) renderer?.let { drawArtwork(it) }
                 }
             })
             sync()
@@ -201,8 +205,7 @@ private class CarVideoSession : Session() {
             override fun onDestroy(owner: LifecycleOwner) {
                 IptvStorage.removeChangeListener(changeListener)
                 try { speedInfo?.removeSpeedListener(speedListener) } catch (_: Throwable) {}
-                hostSurface = null
-                sync()
+                dropRenderer()
                 browser?.release()
                 browser = null
             }
@@ -444,17 +447,20 @@ private class CarArtwork {
     private val loading = HashSet<String>()
     private val failed = HashSet<String>()
 
-    fun draw(surface: Surface, title: String, subtitle: String, url: String?, onLoaded: () -> Unit) {
+    /** Renders the artwork screen into a new Bitmap (null if the size is unknown). */
+    fun render(w: Int, h: Int, title: String, subtitle: String, url: String?, onLoaded: () -> Unit): Bitmap? {
+        if (w <= 0 || h <= 0) return null
         var bmp: Bitmap? = null
         if (!url.isNullOrBlank() && url.startsWith("http")) {
             bmp = cache.get(url)
             if (bmp == null) fetch(url, onLoaded)
         }
-        val canvas: Canvas = try { surface.lockCanvas(null) } catch (_: Throwable) { return }
-        try {
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        run {
             canvas.drawColor(Color.BLACK)
-            val w = canvas.width.toFloat()
-            val h = canvas.height.toFloat()
+            val w = w.toFloat()
+            val h = h.toFloat()
             val box = minOf(w, h) * 0.42f
             val cx = w / 2
             val top = h * 0.14f
@@ -490,9 +496,8 @@ private class CarArtwork {
                 }
                 canvas.drawText(ellipsize(subtitle, sub, w * 0.8f), cx, ty + sub.textSize * 1.5f, sub)
             }
-        } finally {
-            try { surface.unlockCanvasAndPost(canvas) } catch (_: Throwable) {}
         }
+        return out
     }
 
     private fun ellipsize(t: String, p: Paint, max: Float): String =

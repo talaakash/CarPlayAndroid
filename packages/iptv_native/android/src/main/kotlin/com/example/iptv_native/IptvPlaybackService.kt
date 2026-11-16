@@ -776,23 +776,22 @@ class IptvPlaybackService : MediaLibraryService() {
         @Volatile private var carRenderer: CarVideoRenderer? = null
         @Volatile private var fillMode = false
 
-        fun setCarSurface(surface: android.view.Surface, width: Int = 0, height: Int = 0) {
-            carRenderer?.release()
-            val r = CarVideoRenderer(surface).also { it.setFill(fillMode) }
-            val input = r.inputSurface
-            if (input == null) { r.release(); carRenderer = null; carSurface = null; return }
-            carRenderer = r
+        /** The car takes over the video output: the player renders into the renderer's stable surface. */
+        fun setCarSurface(renderer: CarVideoRenderer) {
+            val input = renderer.inputSurface ?: return
+            carRenderer = renderer
+            renderer.setFill(fillMode)
             carSurface = input
             instance?.applyCarSurface()
+            renderer.showVideo()
         }
 
+        /** The car gives the output back (the renderer and its Surface stay alive, owned by the car session). */
         fun clearCarSurface() {
             val old = carSurface ?: return
-            val r = carRenderer
             carSurface = null
             carRenderer = null
             instance?.player?.clearVideoSurface(old)
-            r?.release()
             onCarSurfaceCleared?.invoke()
         }
 

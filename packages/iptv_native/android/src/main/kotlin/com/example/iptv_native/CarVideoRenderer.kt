@@ -1,6 +1,8 @@
 package com.example.iptv_native
 
+import android.graphics.Bitmap
 import android.graphics.SurfaceTexture
+import android.opengl.GLUtils
 import android.opengl.EGL14
 import android.opengl.EGLConfig
 import android.opengl.EGLContext
@@ -17,7 +19,11 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 /**
- * Draws the shared player's video onto the car's host Surface with real Fit / Fill scaling.
+ * Owns the car's host Surface for its whole lifetime and draws onto it with OpenGL only: either
+ * the shared player's video (real Fit / Fill scaling) or the channel artwork. A Surface accepts
+ * one kind of producer (CPU canvas OR GL), so mixing a canvas for artwork with GL for video made
+ * the video refuse to attach after the output was switched; everything now goes through GL, and
+ * switching between artwork and video never touches the Surface itself.
  *
  * A raw car Surface stretches whatever the decoder produces, so the player is pointed at the
  * stable [inputSurface] of this renderer instead, and every frame is drawn into the car
@@ -39,6 +45,11 @@ class CarVideoRenderer(private val target: Surface) {
     private var uTex = 0
     private var hasFrame = false
     private var released = false
+    private var showingVideo = false
+    private var imgProgram = 0
+    private var imgMvp = 0
+    private var imgTex = 0
+    private var hasImage = false
 
     private val texMatrix = FloatArray(16)
     private val mvp = FloatArray(16)
@@ -53,6 +64,10 @@ class CarVideoRenderer(private val target: Surface) {
     private val quad = ByteBuffer.allocateDirect(8 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
         put(floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)); position(0)
     }
+    private val uvFlipped = ByteBuffer.allocateDirect(8 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
+        put(floatArrayOf(0f, 1f, 1f, 1f, 0f, 0f, 1f, 0f)); position(0)
+    }
+    private val identity = FloatArray(16).also { android.opengl.Matrix.setIdentityM(it, 0) }
     private val uv = ByteBuffer.allocateDirect(8 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
         put(floatArrayOf(0f, 0f, 1f, 0f, 0f, 1f, 1f, 1f)); position(0)
     }
@@ -89,6 +104,21 @@ class CarVideoRenderer(private val target: Surface) {
             "#extension GL_OES_EGL_image_external : require\nprecision mediump float; varying vec2 vUv;" +
                 "uniform samplerExternalOES uSampler; void main(){ gl_FragColor = texture2D(uSampler, vUv); }",
         )
+        imgProgram = link(
+            "attribute vec4 aPos; attribute vec2 aUv; uniform mat4 uMvp; varying vec2 vUv;" +
+                "void main(){ gl_Position = uMvp * aPos; vUv = aUv; }",
+            "precision mediump float; varying vec2 vUv; uniform sampler2D uSampler;" +
+                "void main(){ gl_FragColor = texture2D(uSampler, vUv); }",
+        )
+        imgMvp = GLES20.glGetUniformLocation(imgProgram, "uMvp")
+        val it2 = IntArray(1)
+        GLES20.glGenTextures(1, it2, 0)
+        imgTex = it2[0]
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, imgTex)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
         uMvp = GLES20.glGetUniformLocation(program, "uMvp")
         uTex = GLES20.glGetUniformLocation(program, "uTex")
         val t = IntArray(1)
@@ -103,6 +133,9 @@ class CarVideoRenderer(private val target: Surface) {
         st.setOnFrameAvailableListener({ draw(newFrame = true) }, handler)
         texture = st
         inputSurface = Surface(st)
+        val dim = IntArray(1)
+        EGL14.eglQuerySurface(display, eglSurface, EGL14.EGL_WIDTH, dim, 0); width = dim[0]
+        EGL14.eglQuerySurface(display, eglSurface, EGL14.EGL_HEIGHT, dim, 0); height = dim[0]
         draw(newFrame = false) // black until the first frame
     }
 
@@ -117,6 +150,29 @@ class CarVideoRenderer(private val target: Surface) {
         GLES20.glAttachShader(p, compile(GLES20.GL_FRAGMENT_SHADER, fs))
         GLES20.glLinkProgram(p)
         return p
+    }
+
+    /** Pixel size of the host Surface (valid after construction). */
+    @Volatile var width = 0; private set
+    @Volatile var height = 0; private set
+
+    /** Show the player's video (the caller points the player at [inputSurface]). */
+    fun showVideo() {
+        handler.post { showingVideo = true; draw(newFrame = false) }
+    }
+
+    /** Show a full-surface picture (artwork) instead of the video. Takes ownership of [bmp]. */
+    fun showArtwork(bmp: Bitmap) {
+        handler.post {
+            if (released) { bmp.recycle(); return@post }
+            try {
+                GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, imgTex)
+                GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+                hasImage = true
+            } catch (_: Throwable) {} finally { bmp.recycle() }
+            showingVideo = false
+            draw(newFrame = false)
+        }
     }
 
     /** Video size with pixel aspect applied; 0 = unknown (then the picture is simply filled). */
@@ -145,7 +201,20 @@ class CarVideoRenderer(private val target: Surface) {
             GLES20.glViewport(0, 0, w[0], h[0])
             GLES20.glClearColor(0f, 0f, 0f, 1f)
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
-            if (hasFrame) {
+            if (!showingVideo) {
+                if (hasImage) {
+                    android.opengl.Matrix.setIdentityM(mvp, 0)
+                    GLES20.glUseProgram(imgProgram)
+                    GLES20.glUniformMatrix4fv(imgMvp, 1, false, mvp, 0)
+                    GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+                    GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, imgTex)
+                    val aPos = GLES20.glGetAttribLocation(imgProgram, "aPos")
+                    val aUv = GLES20.glGetAttribLocation(imgProgram, "aUv")
+                    GLES20.glEnableVertexAttribArray(aPos); GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 0, quad)
+                    GLES20.glEnableVertexAttribArray(aUv); GLES20.glVertexAttribPointer(aUv, 2, GLES20.GL_FLOAT, false, 0, uvFlipped)
+                    GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+                }
+            } else if (hasFrame) {
                 val sa = w[0].toFloat() / h[0]
                 val va = if (videoWidth > 0 && videoHeight > 0) videoWidth / videoHeight else sa
                 // Fit: shrink the quad so the whole picture is inside. Fill: grow it to cover.
