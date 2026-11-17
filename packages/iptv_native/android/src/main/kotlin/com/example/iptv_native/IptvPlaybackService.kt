@@ -64,10 +64,22 @@ class IptvPlaybackService : MediaLibraryService() {
             .setUserAgent("Mozilla/5.0 (Linux; Android) IPTVPlayer/1.0")
 
         player = ExoPlayer.Builder(this)
-            .setMediaSourceFactory(DefaultMediaSourceFactory(this).setDataSourceFactory(http))
+            // Fallback decoders + tolerant TS parsing: the usual causes of frozen video on IPTV streams.
+            .setRenderersFactory(
+                androidx.media3.exoplayer.DefaultRenderersFactory(this).setEnableDecoderFallback(true)
+            )
+            .setMediaSourceFactory(
+                DefaultMediaSourceFactory(
+                    this,
+                    androidx.media3.extractor.DefaultExtractorsFactory().setTsExtractorFlags(
+                        androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES or
+                            androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS
+                    ),
+                ).setDataSourceFactory(http)
+            )
             .setLoadControl(
                 DefaultLoadControl.Builder()
-                    .setBufferDurationsMs(10_000, 30_000, 2_500, 5_000)
+                    .setBufferDurationsMs(15_000, 50_000, 2_000, 4_000)
                     .build()
             )
             // Audio focus (calls, navigation prompts, other media) and
@@ -82,6 +94,8 @@ class IptvPlaybackService : MediaLibraryService() {
             .setHandleAudioBecomingNoisy(true)
             .setWakeMode(C.WAKE_MODE_NETWORK)
             .build()
+
+        startStallWatchdog()
 
         player.addListener(object : Player.Listener {
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
@@ -316,6 +330,43 @@ class IptvPlaybackService : MediaLibraryService() {
                 ?: return false
             super.setMediaItems(list.map { channelItem(it, scope) }, 0, C.TIME_UNSET)
             return true
+        }
+    }
+
+    // ---- stall watchdog ----------------------------------------------------------
+
+    private var lastPos = -1L
+    private var frozenTicks = 0
+    private var bufferingTicks = 0
+
+    /**
+     * Live streams often stall without raising an error (stuck buffering, or READY with a frozen
+     * clock). Every 3 s: if the player should be playing but made no progress for ~12 s, reload the
+     * stream at the live edge. Runs on the single shared player, so phone and car both recover.
+     */
+    private fun startStallWatchdog() {
+        main.postDelayed(object : Runnable {
+            override fun run() {
+                try { checkStall() } catch (_: Throwable) {}
+                main.postDelayed(this, 3_000)
+            }
+        }, 3_000)
+    }
+
+    private fun checkStall() {
+        if (!player.playWhenReady || player.mediaItemCount == 0 || player.playerError != null ||
+            player.playbackState == Player.STATE_IDLE || player.playbackState == Player.STATE_ENDED) {
+            frozenTicks = 0; bufferingTicks = 0; lastPos = -1; return
+        }
+        val pos = player.currentPosition
+        val buffering = player.playbackState == Player.STATE_BUFFERING
+        bufferingTicks = if (buffering) bufferingTicks + 1 else 0
+        frozenTicks = if (!buffering && pos == lastPos) frozenTicks + 1 else 0
+        lastPos = pos
+        if (bufferingTicks >= 5 || frozenTicks >= 4) {
+            bufferingTicks = 0; frozenTicks = 0
+            player.seekToDefaultPosition()
+            player.prepare()
         }
     }
 

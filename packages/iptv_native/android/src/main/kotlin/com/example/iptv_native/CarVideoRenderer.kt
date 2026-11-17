@@ -243,6 +243,9 @@ class CarVideoRenderer(private val target: Surface) {
         return (r?.width() ?: width) to (r?.height() ?: height)
     }
 
+    /** Drawing area in surface pixels. */
+    fun areaRect(): android.graphics.Rect = clampedArea(width, height) ?: android.graphics.Rect(0, 0, width, height)
+
     private fun clampedArea(w: Int, h: Int): android.graphics.Rect? {
         val a = area ?: return null
         // Only a secondary pane may resize the picture. It takes a big slice of the width, while the

@@ -416,6 +416,15 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
                     super.onSizeChanged(w, h, ow, oh)
                     applyFit()
                 }
+
+                // A second view (full screen) gets its SurfaceTexture only after layout: bind the
+                // player to it again once it is attached so the first frames are not dropped.
+                override fun onAttachedToWindow() {
+                    super.onAttachedToWindow()
+                    if (videoView === this) post {
+                        controller?.let { it.clearVideoTextureView(this); it.setVideoTextureView(this) }
+                    }
+                }
             }
             return object : PlatformView {
                 init {

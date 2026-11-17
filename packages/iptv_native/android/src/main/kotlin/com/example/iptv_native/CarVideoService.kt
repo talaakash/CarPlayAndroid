@@ -111,6 +111,8 @@ private class CarVideoSession : Session() {
             areaChanged()
         }
 
+        override fun onClick(x: Float, y: Float) = onUiClick(x, y)
+
         override fun onSurfaceDestroyed(surfaceContainer: SurfaceContainer) {
             dropRenderer()
             sync()
@@ -185,16 +187,60 @@ private class CarVideoSession : Session() {
 
 
     private var overlayKey = ""
+    private var uiVisible = true
+    private val uiHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val hideUi = Runnable { uiVisible = false; updateOverlay() }
 
-    /** Draws the status (buffering, error, driving...) over the picture instead of a host banner. */
+    /** Controls fade out 3 s after the last touch. */
+    private fun scheduleHide() {
+        uiHandler.removeCallbacks(hideUi)
+        uiHandler.postDelayed(hideUi, 3_000)
+    }
+    private val ui by lazy { CarPlayerUi(carContext) }
+
+    private fun currentChannelId() =
+        browser?.currentMediaItem?.mediaId?.let(IptvPlaybackService::parseChannelId)
+
+    /** Draws the player UI (same design as the phone's full screen) over the picture. */
     private fun updateOverlay() {
         val r = renderer ?: return
-        val m = statusMessage()
+        val md = browser?.currentMediaItem?.mediaMetadata
+        val id = currentChannelId()
+        val st = CarPlayerUi.State(
+            title = md?.title?.toString(),
+            playing = browser?.playWhenReady == true,
+            favorite = id?.let { IptvStorage.isFavorite(carContext, it) },
+            fill = IptvStorage.videoFit(carContext) == IptvStorage.FILL,
+            banner = statusMessage(),
+            visible = uiVisible,
+        )
         val (aw, ah) = r.areaSize()
-        val key = "$m|$aw|$ah"
+        val key = "$st|$aw|$ah"
         if (key == overlayKey) return
         overlayKey = key
-        r.setOverlay(if (m == null) null else artwork.renderBanner(aw, ah, m.first, m.second))
+        r.setOverlay(ui.render(aw, ah, st))
+    }
+
+    private fun onUiClick(x: Float, y: Float) {
+        val r = renderer ?: return
+        val a = r.areaRect()
+        val b = browser
+        if (!uiVisible) { uiVisible = true; scheduleHide(); updateOverlay(); return }
+        val hit = ui.hitTest(x - a.left, y - a.top)
+        if (hit == null) { uiHandler.removeCallbacks(hideUi); uiVisible = false; updateOverlay(); return } // tap on the picture hides the UI
+        scheduleHide()
+        when (hit) {
+            CarPlayerUi.Hit.LIST -> try { carContext.getCarService(androidx.car.app.ScreenManager::class.java).pop() } catch (_: Throwable) {}
+            CarPlayerUi.Hit.PREV -> b?.seekToPreviousMediaItem()
+            CarPlayerUi.Hit.NEXT -> b?.seekToNextMediaItem()
+            CarPlayerUi.Hit.PLAY -> b?.let { if (it.playWhenReady) it.pause() else it.play() }
+            CarPlayerUi.Hit.FIT -> IptvStorage.setVideoFit(
+                carContext,
+                if (IptvStorage.videoFit(carContext) == IptvStorage.FILL) IptvStorage.FIT else IptvStorage.FILL,
+            )
+            CarPlayerUi.Hit.FAVORITE ->
+                b?.sendCustomCommand(SessionCommand(IptvPlaybackService.CMD_TOGGLE_FAVORITE, Bundle.EMPTY), Bundle.EMPTY)
+        }
     }
 
     /** Artwork + channel name on the car surface while the video plays on the phone. */
@@ -221,6 +267,7 @@ private class CarVideoSession : Session() {
                 IptvPlaybackService.setFill(IptvStorage.videoFit(carContext) == IptvStorage.FILL)
                 sync()
             }
+            updateOverlay()
             if (kind == "data" || kind == "settings") {
                 browseScreens.forEach { it.refresh() }
                 screen?.invalidate()
@@ -262,6 +309,7 @@ private class CarVideoSession : Session() {
         lifecycle.addObserver(object : DefaultLifecycleObserver {
             override fun onDestroy(owner: LifecycleOwner) {
                 IptvStorage.removeChangeListener(changeListener)
+                uiHandler.removeCallbacks(hideUi)
                 try { speedInfo?.removeSpeedListener(speedListener) } catch (_: Throwable) {}
                 dropRenderer()
                 browser?.release()
@@ -279,6 +327,8 @@ private class CarVideoSession : Session() {
 
     /** Opens the player screen, or returns to it if it is already in the stack. */
     private fun openPlayer() {
+        uiVisible = true
+        scheduleHide()
         val sm = carContext.getCarService(androidx.car.app.ScreenManager::class.java)
         if (sm.screenStack.any { it.marker == PLAYER_MARKER }) sm.popTo(PLAYER_MARKER)
         else sm.push(VideoScreen(carContext).also { it.marker = PLAYER_MARKER; screen = it })
@@ -287,41 +337,18 @@ private class CarVideoSession : Session() {
     // ---- Player screen --------------------------------------------------------------
 
     private inner class VideoScreen(ctx: CarContext) : Screen(ctx) {
-        private fun currentChannelId() =
-            browser?.currentMediaItem?.mediaId?.let(IptvPlaybackService::parseChannelId)
-
         override fun onGetTemplate(): Template {
-            fun action(res: Int, block: () -> Unit) =
-                Action.Builder().setIcon(icon(res)).setOnClickListener { block() }.build()
-            val playing = browser?.playWhenReady == true
-            val fill = IptvStorage.videoFit(carContext) == IptvStorage.FILL
+            // Everything else (title, favorite, fit/fill, LIVE bar, prev / play / next) is drawn over
+            // the video by CarPlayerUi and handled in onClick. The host strip keeps one entry
+            // (back to the list) as the required action and as the non-touch fallback.
             val builder = NavigationTemplate.Builder()
                 .setBackgroundColor(CarColor.createCustom(Color.BLACK, Color.BLACK))
                 .setActionStrip(
                     ActionStrip.Builder()
-                        // Back to the channel list the user came from; pick another channel there.
-                        .addAction(action(R.drawable.ic_car_list) { screenManager.pop() })
-                        .addAction(action(R.drawable.ic_car_prev) { browser?.seekToPreviousMediaItem() })
-                        .addAction(action(if (playing) R.drawable.ic_car_pause else R.drawable.ic_car_play) {
-                            browser?.let { if (it.playWhenReady) it.pause() else it.play() }
-                        })
-                        .addAction(action(R.drawable.ic_car_next) { browser?.seekToNextMediaItem() })
+                        .addAction(Action.Builder().setIcon(icon(R.drawable.ic_car_blank))
+                            .setOnClickListener { screenManager.pop() }.build())
                         .build()
                 )
-            val mapActions = ActionStrip.Builder()
-            // Shows the mode a tap switches to; the setting is shared with the phone player.
-            mapActions.addAction(action(if (fill) R.drawable.ic_car_fit else R.drawable.ic_car_fill) {
-                IptvStorage.setVideoFit(carContext, if (fill) IptvStorage.FIT else IptvStorage.FILL)
-            })
-            currentChannelId()?.let { id ->
-                val fav = IptvStorage.isFavorite(carContext, id)
-                mapActions.addAction(action(if (fav) R.drawable.ic_car_fav else R.drawable.ic_car_fav_border) {
-                    browser?.sendCustomCommand(SessionCommand(IptvPlaybackService.CMD_TOGGLE_FAVORITE, Bundle.EMPTY), Bundle.EMPTY)
-                })
-            }
-            builder.setMapActionStrip(mapActions.build())
-            // No host message panel: it would shrink the visible area and with it the video.
-            // Status is drawn over the picture by the renderer (see updateOverlay).
             updateOverlay()
             return builder.build()
         }
@@ -403,8 +430,27 @@ private class CarVideoSession : Session() {
 
         private fun row(item: MediaItem): Row {
             val md = item.mediaMetadata
-            val r = Row.Builder().setTitle(md.title?.toString()?.takeIf { it.isNotBlank() } ?: item.mediaId)
-            md.subtitle?.toString()?.takeIf { it.isNotBlank() }?.let { r.addText(it) }
+            val name = md.title?.toString()?.takeIf { it.isNotBlank() } ?: item.mediaId
+            val id = item.mediaId.let(IptvPlaybackService::parseChannelId)
+            val playingId = browser?.currentMediaItem?.mediaId?.let(IptvPlaybackService::parseChannelId)
+            val current = md.isPlayable == true && id != null && id == playingId
+            val fav = md.isPlayable == true && id != null && IptvStorage.isFavorite(carContext, id)
+            // Current channel: ▶ marker + highlighted title; favorites carry a ♥.
+            val styled = android.text.SpannableString(
+                (if (current) "▶  " else "") + name + (if (fav) "  ♥" else "")
+            )
+            if (current) styled.setSpan(
+                androidx.car.app.model.ForegroundCarColorSpan.create(CarColor.BLUE),
+                0, styled.length, android.text.Spanned.SPAN_INCLUSIVE_INCLUSIVE
+            )
+            val r = Row.Builder().setTitle(styled)
+            val sub = md.subtitle?.toString()?.takeIf { it.isNotBlank() }
+            val line = when {
+                current && sub != null -> "Now playing · $sub"
+                current -> "Now playing"
+                else -> sub
+            }
+            line?.let { r.addText(it) }
             when {
                 md.isBrowsable == true -> r.setBrowsable(true).setOnClickListener {
                     screenManager.push(BrowseScreen(carContext, item.mediaId, md.title?.toString() ?: title))
@@ -431,6 +477,7 @@ private class CarVideoSession : Session() {
                 return ListTemplate.Builder().setTitle(title).setHeaderAction(header).setLoading(true).build()
             }
             val lb = ItemList.Builder()
+            val head = ItemList.Builder()
             // At the top level: jump back to the player, and one tap adds/removes the playing
             // channel from Favorites.
             if (parentId == IptvPlaybackService.HOME && page == 0) {
@@ -438,7 +485,7 @@ private class CarVideoSession : Session() {
                 val id = cur?.mediaId?.let(IptvPlaybackService::parseChannelId)
                 if (id != null) {
                     val name = cur.mediaMetadata.title?.toString() ?: "channel"
-                    lb.addItem(
+                    head.addItem(
                         Row.Builder()
                             .setTitle("Now playing")
                             .addText(name)
@@ -447,7 +494,7 @@ private class CarVideoSession : Session() {
                             .build()
                     )
                     val fav = IptvStorage.isFavorite(carContext, id)
-                    lb.addItem(
+                    head.addItem(
                         Row.Builder()
                             .setTitle(if (fav) "Remove from Favorites" else "Add to Favorites")
                             .addText(name)
@@ -465,11 +512,18 @@ private class CarVideoSession : Session() {
                 lb.addItem(Row.Builder().setTitle("Next page").setBrowsable(true)
                     .setOnClickListener { page++; reload() }.build())
             }
-            return ListTemplate.Builder()
+            val lt = ListTemplate.Builder()
                 .setTitle(if (page > 0) "$title · ${page + 1}" else title)
                 .setHeaderAction(header)
-                .setSingleList(lb.build())
-                .build()
+            val headList = head.build()
+            if (headList.items.isEmpty()) {
+                lt.setSingleList(lb.build())
+            } else {
+                // Playing channel + shortcuts in their own section above the browse rows.
+                lt.addSectionedList(androidx.car.app.model.SectionedItemList.create(headList, "Now playing"))
+                lt.addSectionedList(androidx.car.app.model.SectionedItemList.create(lb.build(), title))
+            }
+            return lt.build()
         }
     }
 
@@ -537,29 +591,6 @@ private class CarArtwork {
                 canvas.drawText(ellipsize(subtitle, sub, w * 0.8f), cx, ty + sub.textSize * 1.5f, sub)
             }
         }
-        return out
-    }
-
-    /** Transparent bitmap with a translucent status banner at the top centre (title + text). */
-    fun renderBanner(w: Int, h: Int, title: String, text: String): Bitmap? {
-        if (w <= 0 || h <= 0) return null
-        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(out)
-        val tp = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = Color.WHITE; textSize = h * 0.055f; typeface = Typeface.DEFAULT_BOLD; textAlign = Paint.Align.CENTER
-        }
-        val sp = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = 0xFFCFD8DC.toInt(); textSize = h * 0.042f; textAlign = Paint.Align.CENTER
-        }
-        val maxW = w * 0.7f
-        val t = ellipsize(title, tp, maxW - 48f)
-        val x = ellipsize(text, sp, maxW - 48f)
-        val boxH = tp.textSize * 1.6f + (if (x.isNotBlank()) sp.textSize * 1.5f else 0f) + 24f
-        val box = RectF(w / 2f - maxW / 2f, h * 0.06f, w / 2f + maxW / 2f, h * 0.06f + boxH)
-        canvas.drawRoundRect(box, 20f, 20f, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xCC000000.toInt() })
-        var y = box.top + 12f + tp.textSize * 1.1f
-        canvas.drawText(t, w / 2f, y, tp)
-        if (x.isNotBlank()) { y += sp.textSize * 1.5f; canvas.drawText(x, w / 2f, y, sp) }
         return out
     }
 

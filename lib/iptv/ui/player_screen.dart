@@ -4,6 +4,7 @@ import 'package:material_ui/material_ui.dart';
 import '../automotive/car_connection_service.dart';
 import '../iptv_repository.dart';
 import '../widgets/channel_tile.dart';
+import 'fullscreen_player.dart';
 import 'video_view.dart';
 
 /// Full-screen player. One shared engine plays the stream; this screen decides only what the
@@ -37,6 +38,8 @@ class PlayerScreen extends StatefulWidget {
 class _PlayerScreenState extends State<PlayerScreen> {
   bool _pipSupported = false;
   bool _closing = false;
+  // While the full-screen route is open it owns the one video view.
+  bool _fullscreen = false;
 
   IPTVRepository get repo => widget.repo;
 
@@ -146,7 +149,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       child: Stack(fit: StackFit.expand, children: [
         // Fit / Fill is applied natively to the video surface itself (see IptvNativePlugin.applyFit),
         // so the view simply fills the stage.
-        const NativeVideoView(),
+        if (_fullscreen) const SizedBox.shrink() else const NativeVideoView(),
         if (pc.isBuffering) const Center(child: CircularProgressIndicator(color: Colors.white)),
         if (pc.hasError)
           ColoredBox(
@@ -169,6 +172,18 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 color: Colors.white,
                 icon: Icon(fill ? Icons.fit_screen : Icons.crop_free),
                 onPressed: () => repo.prefs.setFit(fill ? VideoFit.fit : VideoFit.fill),
+              ),
+              IconButton(
+                tooltip: 'Full screen',
+                color: Colors.white,
+                icon: const Icon(Icons.fullscreen),
+                onPressed: () async {
+                  setState(() => _fullscreen = true);
+                  await WidgetsBinding.instance.endOfFrame;
+                  if (!mounted) return;
+                  await FullscreenPlayer.open(context, repo);
+                  if (mounted) setState(() => _fullscreen = false);
+                },
               ),
               if (_pipSupported)
                 IconButton(
