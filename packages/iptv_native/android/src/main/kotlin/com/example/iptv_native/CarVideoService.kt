@@ -260,6 +260,44 @@ private class CarVideoSession : Session() {
     private fun icon(res: Int) =
         CarIcon.Builder(IconCompat.createWithResource(carContext, res)).setTint(CarColor.DEFAULT).build()
 
+    /**
+     * The phone app's accent (Settings > Accent) as the Material 3 "primary" for a dark surface, so
+     * highlights in the car match the phone. The phone stores it in Flutter's shared preferences;
+     * it is read on every template build, so a change shows up on the next refresh.
+     */
+    private fun accent(): CarColor {
+        val name = try {
+            carContext.getSharedPreferences("FlutterSharedPreferences", android.content.Context.MODE_PRIVATE)
+                .getString("flutter.iptv.accent", null)
+        } catch (_: Throwable) { null }
+        val argb = when (name) {
+            "blue" -> 0xFFAAC7FF
+            "red" -> 0xFFFFB4AB
+            "green" -> 0xFF78DC77
+            "purple" -> 0xFFDDB8FF
+            "orange" -> 0xFFFFB68A
+            else -> 0xFFCFBCFF // deepPurple (default seed)
+        }.toInt()
+        return CarColor.createCustom(argb, argb)
+    }
+
+    /** Text spans only accept the host's standard colors (custom ones crash the template): nearest match. */
+    private fun textAccent(): CarColor = when (
+        try {
+            carContext.getSharedPreferences("FlutterSharedPreferences", android.content.Context.MODE_PRIVATE)
+                .getString("flutter.iptv.accent", null)
+        } catch (_: Throwable) { null }
+    ) {
+        "blue" -> CarColor.BLUE
+        "red" -> CarColor.RED
+        "green" -> CarColor.GREEN
+        else -> CarColor.PRIMARY
+    }
+
+    /** Accent-tinted glyph for list rows / header actions. */
+    private fun accentIcon(res: Int) =
+        CarIcon.Builder(IconCompat.createWithResource(carContext, res)).setTint(accent()).build()
+
     /** Shared data changed (phone or car): settings re-route video, lists reload in place. */
     private val changeListener: (String) -> Unit = { kind ->
         ContextCompat.getMainExecutor(carContext).execute {
@@ -387,6 +425,20 @@ private class CarVideoSession : Session() {
                 .getContentLimit(ConstraintManager.CONTENT_LIMIT_TYPE_LIST)
         } catch (_: Throwable) { 6 } - 3).coerceIn(3, 48)
 
+        private var thumbPending = false
+
+        /** Logos arrive one by one: redraw the list at most every 400 ms. */
+        private fun thumbLoaded() {
+            ContextCompat.getMainExecutor(carContext).execute {
+                if (thumbPending) return@execute
+                thumbPending = true
+                android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                    thumbPending = false
+                    try { invalidate() } catch (_: Throwable) {}
+                }, 400)
+            }
+        }
+
         private fun reload() { items = null; failed = false; requested = false; invalidate() }
 
         /** Re-fetch but keep showing the current rows until the new ones arrive (no flicker). */
@@ -428,30 +480,45 @@ private class CarVideoSession : Session() {
             browser?.sendCustomCommand(SessionCommand(IptvPlaybackService.CMD_TOGGLE_FAVORITE, Bundle.EMPTY), Bundle.EMPTY)
         }
 
-        private fun row(item: MediaItem): Row {
+        /** Icon for a folder row, matching the phone's chips / menus. */
+        private fun folderImage(item: MediaItem, name: String): CarIcon {
+            val id = item.mediaId
+            val P = IptvPlaybackService
+            val res = when {
+                id == P.FAVORITES -> R.drawable.ic_car_fav
+                id == P.RECENTS -> R.drawable.ic_car_history
+                id == P.CATEGORIES || id.startsWith(P.CAT_PREFIX) -> R.drawable.ic_car_category
+                id == P.COUNTRIES || id.startsWith(P.COUNTRY_PREFIX) -> R.drawable.ic_car_country
+                id == P.PLAYLISTS || id == P.PLAYLIST_ACTIVE -> R.drawable.ic_car_playlist
+                id.startsWith(P.AZ_PREFIX) ->
+                    return CarIcon.Builder(IconCompat.createWithBitmap(artwork.thumb(id.removePrefix(P.AZ_PREFIX), null) {})).build()
+                else -> R.drawable.ic_car_tv
+            }
+            return accentIcon(res)
+        }
+
+        private fun row(item: MediaItem, toPlayer: Boolean = false): Row {
             val md = item.mediaMetadata
             val name = md.title?.toString()?.takeIf { it.isNotBlank() } ?: item.mediaId
             val id = item.mediaId.let(IptvPlaybackService::parseChannelId)
             val playingId = browser?.currentMediaItem?.mediaId?.let(IptvPlaybackService::parseChannelId)
             val current = md.isPlayable == true && id != null && id == playingId
             val fav = md.isPlayable == true && id != null && IptvStorage.isFavorite(carContext, id)
-            // Current channel: ▶ marker + highlighted title; favorites carry a ♥.
-            val styled = android.text.SpannableString(
-                (if (current) "▶  " else "") + name + (if (fav) "  ♥" else "")
-            )
-            if (current) styled.setSpan(
-                androidx.car.app.model.ForegroundCarColorSpan.create(CarColor.BLUE),
-                0, styled.length, android.text.Spanned.SPAN_INCLUSIVE_INCLUSIVE
-            )
+            // Plain text only: this host rejects colored spans in row text (it crashed the template).
+            val styled = (if (current) "▶  " else "") + name + (if (fav) "  ♥" else "")
             val r = Row.Builder().setTitle(styled)
-            val sub = md.subtitle?.toString()?.takeIf { it.isNotBlank() }
-            val line = when {
-                current && sub != null -> "Now playing · $sub"
-                current -> "Now playing"
-                else -> sub
+            if (md.isPlayable == true) {
+                val bmp = artwork.thumb(name, md.artworkUri?.toString(), onLoaded = { thumbLoaded() })
+                r.setImage(CarIcon.Builder(IconCompat.createWithBitmap(bmp)).build(), Row.IMAGE_TYPE_LARGE)
+            } else if (md.isBrowsable == true) {
+                r.setImage(folderImage(item, name), Row.IMAGE_TYPE_ICON)
             }
-            line?.let { r.addText(it) }
+            val sub = md.subtitle?.toString()?.takeIf { it.isNotBlank() }
+            if (current) {
+                r.addText(if (sub != null) "Now playing · $sub" else "Now playing")
+            } else sub?.let { r.addText(it) }
             when {
+                toPlayer -> r.setBrowsable(true).setOnClickListener { openPlayer() }
                 md.isBrowsable == true -> r.setBrowsable(true).setOnClickListener {
                     screenManager.push(BrowseScreen(carContext, item.mediaId, md.title?.toString() ?: title))
                 }
@@ -459,6 +526,24 @@ private class CarVideoSession : Session() {
                 // else: explanatory row ("No favorites yet", ...) with no action
             }
             return r.build()
+        }
+
+        /** Header actions: jump back to the player (any list) and favorite the playing channel (top level). */
+        private fun actionStrip(playingId: String?): ActionStrip? {
+            if (playingId == null) return null
+            val strip = ActionStrip.Builder()
+            if (parentId == IptvPlaybackService.HOME) {
+                val fav = IptvStorage.isFavorite(carContext, playingId)
+                strip.addAction(
+                    Action.Builder()
+                        .setIcon(if (fav) CarIcon.Builder(IconCompat.createWithResource(carContext, R.drawable.ic_car_fav))
+                            .setTint(CarColor.RED).build() else icon(R.drawable.ic_car_fav_border))
+                        .setOnClickListener { toggleFavorite() }.build()
+                )
+            }
+            strip.addAction(Action.Builder().setIcon(accentIcon(R.drawable.ic_car_nowplaying))
+                .setOnClickListener { openPlayer() }.build())
+            return strip.build()
         }
 
         override fun onGetTemplate(): Template {
@@ -477,52 +562,29 @@ private class CarVideoSession : Session() {
                 return ListTemplate.Builder().setTitle(title).setHeaderAction(header).setLoading(true).build()
             }
             val lb = ItemList.Builder()
-            val head = ItemList.Builder()
-            // At the top level: jump back to the player, and one tap adds/removes the playing
-            // channel from Favorites.
-            if (parentId == IptvPlaybackService.HOME && page == 0) {
-                val cur = b?.currentMediaItem
-                val id = cur?.mediaId?.let(IptvPlaybackService::parseChannelId)
-                if (id != null) {
-                    val name = cur.mediaMetadata.title?.toString() ?: "channel"
-                    head.addItem(
-                        Row.Builder()
-                            .setTitle("Now playing")
-                            .addText(name)
-                            .setBrowsable(true)
-                            .setOnClickListener { openPlayer() }
-                            .build()
-                    )
-                    val fav = IptvStorage.isFavorite(carContext, id)
-                    head.addItem(
-                        Row.Builder()
-                            .setTitle(if (fav) "Remove from Favorites" else "Add to Favorites")
-                            .addText(name)
-                            .setOnClickListener { toggleFavorite() }
-                            .build()
-                    )
-                }
+            val playing = b?.currentMediaItem
+            val playingId = playing?.mediaId?.let(IptvPlaybackService::parseChannelId)
+            // Top level: the playing channel is the first row (tap = back to the player); its
+            // favorite toggle and the player shortcut live in the header, so the list stays clean.
+            if (parentId == IptvPlaybackService.HOME && page == 0 && playing != null && playingId != null) {
+                lb.addItem(row(playing, toPlayer = true))
             }
             if (page > 0) {
-                lb.addItem(Row.Builder().setTitle("Previous page").setBrowsable(true)
-                    .setOnClickListener { page--; reload() }.build())
+                lb.addItem(Row.Builder().setTitle("Previous page").addText("Page $page")
+                    .setImage(accentIcon(R.drawable.ic_car_chevron_left), Row.IMAGE_TYPE_ICON)
+                    .setBrowsable(true).setOnClickListener { page--; reload() }.build())
             }
             list.forEach { lb.addItem(row(it)) }
             if (hasNext) {
-                lb.addItem(Row.Builder().setTitle("Next page").setBrowsable(true)
-                    .setOnClickListener { page++; reload() }.build())
+                lb.addItem(Row.Builder().setTitle("Next page").addText("Page ${page + 2}")
+                    .setImage(accentIcon(R.drawable.ic_car_chevron_right), Row.IMAGE_TYPE_ICON)
+                    .setBrowsable(true).setOnClickListener { page++; reload() }.build())
             }
             val lt = ListTemplate.Builder()
                 .setTitle(if (page > 0) "$title · ${page + 1}" else title)
                 .setHeaderAction(header)
-            val headList = head.build()
-            if (headList.items.isEmpty()) {
-                lt.setSingleList(lb.build())
-            } else {
-                // Playing channel + shortcuts in their own section above the browse rows.
-                lt.addSectionedList(androidx.car.app.model.SectionedItemList.create(headList, "Now playing"))
-                lt.addSectionedList(androidx.car.app.model.SectionedItemList.create(lb.build(), title))
-            }
+                .setSingleList(lb.build())
+            actionStrip(playingId)?.let { lt.setActionStrip(it) }
             return lt.build()
         }
     }
@@ -596,6 +658,62 @@ private class CarArtwork {
 
     private fun ellipsize(t: String, p: Paint, max: Float): String =
         android.text.TextUtils.ellipsize(t, android.text.TextPaint(p), max, android.text.TextUtils.TruncateAt.END).toString()
+
+    private val thumbs = android.util.LruCache<String, Bitmap>(96)
+    private val thumbLoading = HashSet<String>()
+    private val tiles = HashMap<String, Bitmap>()
+
+    /** Small logo for a list row; a letter tile while it loads (or if the channel has no logo). */
+    fun thumb(name: String, url: String?, onLoaded: () -> Unit): Bitmap {
+        if (!url.isNullOrBlank() && url.startsWith("http")) {
+            thumbs.get(url)?.let { return it }
+            val start = synchronized(thumbLoading) { url !in failed && thumbLoading.add(url) }
+            if (start) Thread {
+                try {
+                    val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+                    conn.connectTimeout = 8_000
+                    conn.readTimeout = 8_000
+                    val raw = conn.inputStream.use { BitmapFactory.decodeStream(it) }
+                    if (raw != null) {
+                        thumbs.put(url, tile(raw)); onLoaded()
+                    } else synchronized(thumbLoading) { failed.add(url) }
+                } catch (_: Throwable) {
+                    synchronized(thumbLoading) { failed.add(url) }
+                } finally {
+                    synchronized(thumbLoading) { thumbLoading.remove(url) }
+                }
+            }.start()
+        }
+        val letter = name.trim().firstOrNull()?.uppercase() ?: "?"
+        return tiles.getOrPut(letter) {
+            val b = Bitmap.createBitmap(TILE, TILE, Bitmap.Config.ARGB_8888)
+            val c = Canvas(b)
+            c.drawRoundRect(RectF(0f, 0f, TILE.toFloat(), TILE.toFloat()), 16f, 16f,
+                Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF37474F.toInt() })
+            val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                color = Color.WHITE; textSize = TILE * 0.5f; typeface = Typeface.DEFAULT_BOLD; textAlign = Paint.Align.CENTER
+            }
+            c.drawText(letter, TILE / 2f, TILE / 2f - (p.descent() + p.ascent()) / 2f, p)
+            b
+        }
+    }
+
+    /** Logo centred on a light rounded square, like the app's channel tiles. */
+    private fun tile(src: Bitmap): Bitmap {
+        val b = Bitmap.createBitmap(TILE, TILE, Bitmap.Config.ARGB_8888)
+        val c = Canvas(b)
+        c.drawRoundRect(RectF(0f, 0f, TILE.toFloat(), TILE.toFloat()), 16f, 16f,
+            Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFFECEFF1.toInt() })
+        val inner = TILE * 0.8f
+        val sc = minOf(inner / src.width, inner / src.height)
+        val w = src.width * sc
+        val h = src.height * sc
+        c.drawBitmap(src, null, RectF((TILE - w) / 2, (TILE - h) / 2, (TILE + w) / 2, (TILE + h) / 2),
+            Paint(Paint.FILTER_BITMAP_FLAG))
+        return b
+    }
+
+    private companion object { const val TILE = 96 }
 
     private fun fetch(url: String, onLoaded: () -> Unit) {
         synchronized(loading) { if (url in failed || !loading.add(url)) return }
