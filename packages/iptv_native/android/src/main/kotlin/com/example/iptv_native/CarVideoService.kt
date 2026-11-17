@@ -42,6 +42,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.graphics.drawable.IconCompat
 import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
+import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.session.LibraryResult
@@ -198,8 +199,20 @@ private class CarVideoSession : Session() {
     }
     private val ui by lazy { CarPlayerUi(carContext) }
 
+    /** IPTV channel id (null for local videos: no favorites). */
     private fun currentChannelId() =
-        browser?.currentMediaItem?.mediaId?.let(IptvPlaybackService::parseChannelId)
+        browser?.currentMediaItem?.mediaId?.takeIf { !IptvPlaybackService.isLocal(it) }
+            ?.let(IptvPlaybackService::parseChannelId)
+
+    private fun currentIsLocal() = IptvPlaybackService.isLocal(browser?.currentMediaItem?.mediaId)
+
+    /** Local video progress needs a once-a-second redraw while it plays and the controls show. */
+    private val progressTick = object : Runnable {
+        override fun run() {
+            if (uiVisible && currentIsLocal() && browser?.isPlaying == true) updateOverlay()
+            uiHandler.postDelayed(this, 1_000)
+        }
+    }
 
     /** Draws the player UI (same design as the phone's full screen) over the picture. */
     private fun updateOverlay() {
@@ -213,6 +226,11 @@ private class CarVideoSession : Session() {
             fill = IptvStorage.videoFit(carContext) == IptvStorage.FILL,
             banner = statusMessage(),
             visible = uiVisible,
+            progress = if (currentIsLocal()) {
+                val b = browser
+                (b?.currentPosition ?: 0L).coerceAtLeast(0L) / 1000 to
+                    (b?.duration?.takeIf { it != C.TIME_UNSET } ?: -1L).let { if (it > 0) it / 1000 else -1L }
+            } else null,
         )
         val (aw, ah) = r.areaSize()
         val key = "$st|$aw|$ah"
@@ -226,6 +244,11 @@ private class CarVideoSession : Session() {
         val a = r.areaRect()
         val b = browser
         if (!uiVisible) { uiVisible = true; scheduleHide(); updateOverlay(); return }
+        ui.seekFraction(x - a.left, y - a.top)?.let { f ->
+            val d = b?.duration ?: C.TIME_UNSET
+            if (b != null && d != C.TIME_UNSET && d > 0) { scheduleHide(); b.seekTo((d * f).toLong()); updateOverlay() }
+            return
+        }
         val hit = ui.hitTest(x - a.left, y - a.top)
         if (hit == null) { uiHandler.removeCallbacks(hideUi); uiVisible = false; updateOverlay(); return } // tap on the picture hides the UI
         scheduleHide()
@@ -233,6 +256,7 @@ private class CarVideoSession : Session() {
             CarPlayerUi.Hit.LIST -> try { carContext.getCarService(androidx.car.app.ScreenManager::class.java).pop() } catch (_: Throwable) {}
             CarPlayerUi.Hit.PREV -> b?.seekToPreviousMediaItem()
             CarPlayerUi.Hit.NEXT -> b?.seekToNextMediaItem()
+            CarPlayerUi.Hit.SEEK -> {}
             CarPlayerUi.Hit.PLAY -> b?.let { if (it.playWhenReady) it.pause() else it.play() }
             CarPlayerUi.Hit.FIT -> IptvStorage.setVideoFit(
                 carContext,
@@ -343,11 +367,13 @@ private class CarVideoSession : Session() {
 
         IptvPlaybackService.setFill(IptvStorage.videoFit(ctx) == IptvStorage.FILL)
         IptvStorage.addChangeListener(changeListener)
+        uiHandler.postDelayed(progressTick, 1_000)
 
         lifecycle.addObserver(object : DefaultLifecycleObserver {
             override fun onDestroy(owner: LifecycleOwner) {
                 IptvStorage.removeChangeListener(changeListener)
                 uiHandler.removeCallbacks(hideUi)
+                uiHandler.removeCallbacks(progressTick)
                 try { speedInfo?.removeSpeedListener(speedListener) } catch (_: Throwable) {}
                 dropRenderer()
                 browser?.release()
@@ -503,7 +529,8 @@ private class CarVideoSession : Session() {
             val id = item.mediaId.let(IptvPlaybackService::parseChannelId)
             val playingId = browser?.currentMediaItem?.mediaId?.let(IptvPlaybackService::parseChannelId)
             val current = md.isPlayable == true && id != null && id == playingId
-            val fav = md.isPlayable == true && id != null && IptvStorage.isFavorite(carContext, id)
+            val fav = md.isPlayable == true && id != null && !IptvPlaybackService.isLocal(item.mediaId) &&
+                IptvStorage.isFavorite(carContext, id)
             // Plain text only: this host rejects colored spans in row text (it crashed the template).
             val styled = (if (current) "▶  " else "") + name + (if (fav) "  ♥" else "")
             val r = Row.Builder().setTitle(styled)
@@ -532,7 +559,7 @@ private class CarVideoSession : Session() {
         private fun actionStrip(playingId: String?): ActionStrip? {
             if (playingId == null) return null
             val strip = ActionStrip.Builder()
-            if (parentId == IptvPlaybackService.HOME) {
+            if (parentId == IptvPlaybackService.HOME && !IptvPlaybackService.isLocal(browser?.currentMediaItem?.mediaId)) {
                 val fav = IptvStorage.isFavorite(carContext, playingId)
                 strip.addAction(
                     Action.Builder()

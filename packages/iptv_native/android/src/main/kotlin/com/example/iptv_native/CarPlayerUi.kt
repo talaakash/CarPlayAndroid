@@ -20,7 +20,7 @@ import androidx.core.content.ContextCompat
  */
 internal class CarPlayerUi(private val ctx: Context) {
 
-    enum class Hit { LIST, FAVORITE, FIT, PREV, PLAY, NEXT }
+    enum class Hit { LIST, FAVORITE, FIT, PREV, PLAY, NEXT, SEEK }
 
     data class State(
         val title: String?,
@@ -29,9 +29,24 @@ internal class CarPlayerUi(private val ctx: Context) {
         val fill: Boolean,
         val banner: Pair<String, String>?,
         val visible: Boolean,
+        /** Local video: (position seconds, duration seconds). null = live IPTV channel ("LIVE" bar). */
+        val progress: Pair<Long, Long>? = null,
     )
 
     private val hits = ArrayList<Pair<RectF, Hit>>()
+    private var seekBar: RectF? = null
+
+    /** Fraction (0..1) of the progress bar under an area-local tap, or null when it is not on the bar. */
+    fun seekFraction(x: Float, y: Float): Float? {
+        val b = seekBar ?: return null
+        if (!b.contains(x, y)) return null
+        return ((x - b.left) / b.width()).coerceIn(0f, 1f)
+    }
+
+    private fun fmt(sec: Long): String {
+        val h = sec / 3600; val m = (sec % 3600) / 60; val s = sec % 60
+        return if (h > 0) "%d:%02d:%02d".format(h, m, s) else "%d:%02d".format(m, s)
+    }
 
     /** Area-local coordinates (the bitmap's own pixel space). */
     fun hitTest(x: Float, y: Float): Hit? = hits.firstOrNull { it.first.contains(x, y) }?.second
@@ -51,6 +66,7 @@ internal class CarPlayerUi(private val ctx: Context) {
     fun render(w: Int, h: Int, s: State): Bitmap? {
         if (w <= 0 || h <= 0) return null
         hits.clear()
+        seekBar = null
         val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val c = Canvas(out)
         val fw = w.toFloat()
@@ -81,22 +97,42 @@ internal class CarPlayerUi(private val ctx: Context) {
             c.drawText(t.toString(), left, topY + tp.textSize * 0.35f, tp)
         }
 
-        // LIVE bar (full, not interactive)
         val barY = fh * 0.80f
         val th = (fh * 0.008f).coerceAtLeast(4f)
         val lp = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = Color.WHITE; textSize = fh * 0.032f; typeface = Typeface.DEFAULT_BOLD
         }
-        paint.color = 0xFFE53935.toInt()
-        c.drawCircle(margin + th * 1.2f, barY, th * 1.2f, paint)
-        val labelX = margin + th * 3.2f
-        c.drawText("LIVE", labelX, barY + lp.textSize * 0.35f, lp)
-        val barL = labelX + lp.measureText("LIVE") + fw * 0.02f
-        val barR = fw - margin
-        paint.color = 0x55FFFFFF
-        c.drawRoundRect(RectF(barL, barY - th / 2, barR, barY + th / 2), th, th, paint)
-        paint.color = 0xFFE53935.toInt()
-        c.drawRoundRect(RectF(barL, barY - th / 2, barR, barY + th / 2), th, th, paint)
+        val prog = s.progress
+        if (prog == null) {
+            // LIVE bar (full, not interactive)
+            paint.color = 0xFFE53935.toInt()
+            c.drawCircle(margin + th * 1.2f, barY, th * 1.2f, paint)
+            val labelX = margin + th * 3.2f
+            c.drawText("LIVE", labelX, barY + lp.textSize * 0.35f, lp)
+            val barL = labelX + lp.measureText("LIVE") + fw * 0.02f
+            val barR = fw - margin
+            paint.color = 0x55FFFFFF
+            c.drawRoundRect(RectF(barL, barY - th / 2, barR, barY + th / 2), th, th, paint)
+            paint.color = 0xFFE53935.toInt()
+            c.drawRoundRect(RectF(barL, barY - th / 2, barR, barY + th / 2), th, th, paint)
+        } else {
+            // Local video: elapsed time, seekable progress bar (tap to jump), total time.
+            val (pos, dur) = prog
+            val left = fmt(pos)
+            val right = if (dur > 0) fmt(dur) else "--:--"
+            val lw = lp.measureText("00:00:00")
+            c.drawText(left, margin, barY + lp.textSize * 0.35f, lp)
+            val barL = margin + lw + fw * 0.015f
+            val barR = fw - margin - lw - fw * 0.015f
+            c.drawText(right, barR + fw * 0.015f, barY + lp.textSize * 0.35f, lp)
+            paint.color = 0x55FFFFFF
+            c.drawRoundRect(RectF(barL, barY - th / 2, barR, barY + th / 2), th, th, paint)
+            val f = if (dur > 0) (pos.toFloat() / dur).coerceIn(0f, 1f) else 0f
+            paint.color = 0xFFFFFFFF.toInt()
+            c.drawRoundRect(RectF(barL, barY - th / 2, barL + (barR - barL) * f, barY + th / 2), th, th, paint)
+            c.drawCircle(barL + (barR - barL) * f, barY, th * 1.8f, paint)
+            if (dur > 0) seekBar = RectF(barL - th, barY - fh * 0.04f, barR + th, barY + fh * 0.04f)
+        }
 
         // transport
         val rowY = fh * 0.91f

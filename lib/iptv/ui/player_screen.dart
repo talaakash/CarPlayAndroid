@@ -4,6 +4,7 @@ import 'package:material_ui/material_ui.dart';
 import '../automotive/car_connection_service.dart';
 import '../iptv_repository.dart';
 import '../widgets/channel_tile.dart';
+import '../widgets/local_seek_bar.dart';
 import 'fullscreen_player.dart';
 import 'video_view.dart';
 
@@ -157,7 +158,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
             child: Center(
               child: Column(mainAxisSize: MainAxisSize.min, children: [
                 const Icon(Icons.error_outline, color: Colors.redAccent, size: 40),
-                const Text('This channel cannot be played right now.', style: TextStyle(color: Colors.white70)),
+                Text(pc.isLocal ? 'This video cannot be played (unsupported or unreadable file).' : 'This channel cannot be played right now.',
+                    textAlign: TextAlign.center, style: const TextStyle(color: Colors.white70)),
                 TextButton(onPressed: pc.retry, child: const Text('Retry')),
               ]),
             ),
@@ -247,7 +249,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
         : pc.isBuffering
             ? 'Buffering…'
             : pc.isPlaying
-                ? 'Live'
+                ? (pc.isLocal ? 'Playing' : 'Live')
                 : 'Paused';
 
     return Padding(
@@ -260,6 +262,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
               Text('$status · ${ch.group}', maxLines: 1, overflow: TextOverflow.ellipsis, style: theme.textTheme.bodyMedium),
             ]),
           ),
+          if (!pc.isLocal)
           IconButton(
             tooltip: 'Favorite',
             iconSize: 28,
@@ -269,8 +272,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
           ),
         ]),
         const SizedBox(height: 8),
+        if (pc.isLocal) LocalSeekBar(playback: pc),
         Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-          IconButton(iconSize: big ? 48 : 40, style: sized(), tooltip: 'Previous channel', icon: const Icon(Icons.skip_previous), onPressed: pc.previous),
+          if (pc.isLocal) ...[
+            IconButton(iconSize: big ? 40 : 32, style: sized(), tooltip: 'Back 10 seconds', icon: const Icon(Icons.replay_10), onPressed: () => pc.seekBy(const Duration(seconds: -10))),
+            SizedBox(width: gap / 2),
+          ],
+          IconButton(iconSize: big ? 48 : 40, style: sized(), tooltip: pc.isLocal ? 'Previous video' : 'Previous channel', icon: const Icon(Icons.skip_previous), onPressed: pc.previous),
           SizedBox(width: gap),
           IconButton.filled(
             iconSize: big ? 48 : 44,
@@ -281,7 +289,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
             onPressed: parked.playbackBlocked ? null : pc.togglePlay,
           ),
           SizedBox(width: gap),
-          IconButton(iconSize: big ? 48 : 40, style: sized(), tooltip: 'Next channel', icon: const Icon(Icons.skip_next), onPressed: pc.next),
+          IconButton(iconSize: big ? 48 : 40, style: sized(), tooltip: pc.isLocal ? 'Next video' : 'Next channel', icon: const Icon(Icons.skip_next), onPressed: pc.next),
+          if (pc.isLocal) ...[
+            SizedBox(width: gap / 2),
+            IconButton(iconSize: big ? 40 : 32, style: sized(), tooltip: 'Forward 10 seconds', icon: const Icon(Icons.forward_10), onPressed: () => pc.seekBy(const Duration(seconds: 10))),
+          ],
         ]),
         const SizedBox(height: 16),
         Text('Play video on', style: theme.textTheme.labelLarge),

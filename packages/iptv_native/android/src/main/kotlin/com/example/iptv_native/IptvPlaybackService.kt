@@ -75,7 +75,7 @@ class IptvPlaybackService : MediaLibraryService() {
                         androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_ALLOW_NON_IDR_KEYFRAMES or
                             androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory.FLAG_DETECT_ACCESS_UNITS
                     ),
-                ).setDataSourceFactory(http)
+                ).setDataSourceFactory(androidx.media3.datasource.DefaultDataSource.Factory(this, http)) // http(s) + content:// + file:// (local videos)
             )
             .setLoadControl(
                 DefaultLoadControl.Builder()
@@ -101,8 +101,11 @@ class IptvPlaybackService : MediaLibraryService() {
             override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
                 val id = mediaItem?.mediaId?.let(::parseChannelId) ?: return
                 retryCount = 0
-                IptvStorage.addRecent(applicationContext, id)
-                notifyLibraryChanged(RECENTS)
+                // Local videos are not channels: they never enter the IPTV recents list.
+                if (!isLocal(mediaItem.mediaId)) {
+                    IptvStorage.addRecent(applicationContext, id)
+                    notifyLibraryChanged(RECENTS)
+                }
                 updateFavoriteButton()
             }
 
@@ -187,8 +190,9 @@ class IptvPlaybackService : MediaLibraryService() {
         MediaSession.ConnectionResult.DEFAULT_SESSION_AND_LIBRARY_COMMANDS.buildUpon()
             .add(SessionCommand(CMD_TOGGLE_FAVORITE, Bundle.EMPTY)).build()
 
+    /** IPTV channel id of the current item; null for local videos (no favorites for them). */
     private fun currentChannelId(): String? =
-        player.currentMediaItem?.mediaId?.let(::parseChannelId)
+        player.currentMediaItem?.mediaId?.takeIf { !isLocal(it) }?.let(::parseChannelId)
 
     /** Heart button on the playback screen; filled when the current channel is a favorite. */
     private fun updateFavoriteButton() {
@@ -251,8 +255,10 @@ class IptvPlaybackService : MediaLibraryService() {
                     Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM, Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM,
                 )
             }
-            // Live streams: no scrubbing buttons in the car UI.
-            b.removeAll(Player.COMMAND_SEEK_BACK, Player.COMMAND_SEEK_FORWARD)
+            // Live streams: no scrubbing buttons in the car UI. Local videos are seekable.
+            if (!isLocal(currentMediaItem?.mediaId)) {
+                b.removeAll(Player.COMMAND_SEEK_BACK, Player.COMMAND_SEEK_FORWARD)
+            }
             // Driving without platform support for background audio: nobody may resume
             // playback until the vehicle is parked again.
             if (ParkedVideoPolicy.playbackBlocked) b.remove(Player.COMMAND_PLAY_PAUSE)
@@ -354,6 +360,8 @@ class IptvPlaybackService : MediaLibraryService() {
     }
 
     private fun checkStall() {
+        // Local files are not live: a paused/slow file must never be "reloaded at the live edge".
+        if (isLocal(player.currentMediaItem?.mediaId)) { frozenTicks = 0; bufferingTicks = 0; lastPos = -1; return }
         if (!player.playWhenReady || player.mediaItemCount == 0 || player.playerError != null ||
             player.playbackState == Player.STATE_IDLE || player.playbackState == Player.STATE_ENDED) {
             frozenTicks = 0; bufferingTicks = 0; lastPos = -1; return
@@ -514,6 +522,7 @@ class IptvPlaybackService : MediaLibraryService() {
                 // the car screen's channel browser starts here.
                 parentId == HOME -> listOf(
                     folder(AZ, "All Channels", count(IptvStorage.channels(ctx).size, "channel")),
+                    folder(LOCAL_SCOPE, "Local videos", count(IptvStorage.localVideos(ctx).size, "video")),
                     folder(CATEGORIES, "Categories", count(IptvStorage.groups(ctx).size, "group")),
                     folder(COUNTRIES, "Countries", count(IptvStorage.countries(ctx).size, "country")),
                     folder(FAVORITES, "Favorites", count(IptvStorage.favorites(ctx).size, "channel")),
@@ -672,13 +681,15 @@ class IptvPlaybackService : MediaLibraryService() {
     private fun resolveForPlayback(item: MediaItem): MediaItem? {
         if (item.localConfiguration != null) return item
         val id = parseChannelId(item.mediaId) ?: return null
-        val ch = IptvStorage.channelById(applicationContext, id) ?: return null
+        val ch = IptvStorage.channelById(applicationContext, id)
+            ?: IptvStorage.localVideos(applicationContext).firstOrNull { it.id == id } ?: return null
         return channelItem(ch, parseScope(item.mediaId) ?: ALL)
     }
 
     private fun resolveChannelItem(mediaId: String): MediaItem? {
         val id = parseChannelId(mediaId) ?: return null
-        val ch = IptvStorage.channelById(applicationContext, id) ?: return null
+        val ch = IptvStorage.channelById(applicationContext, id)
+            ?: IptvStorage.localVideos(applicationContext).firstOrNull { it.id == id } ?: return null
         return channelItem(ch, parseScope(mediaId) ?: ALL)
     }
 
@@ -686,6 +697,7 @@ class IptvPlaybackService : MediaLibraryService() {
         scope == FAVORITES -> IptvStorage.favorites(applicationContext)
         scope == RECENTS -> IptvStorage.recents(applicationContext)
         scope == ALL -> IptvStorage.channels(applicationContext)
+        scope == LOCAL_SCOPE -> IptvStorage.localVideos(applicationContext)
         scope == SELECTED -> scopeChannels(IptvStorage.selection(applicationContext).scope)
         scope.startsWith(CAT_PREFIX) -> {
             val g = scope.removePrefix(CAT_PREFIX)
@@ -730,6 +742,7 @@ class IptvPlaybackService : MediaLibraryService() {
         id == PLAYLIST_ACTIVE -> folder(PLAYLIST_ACTIVE, IptvStorage.playlists(applicationContext).firstOrNull { it.active }?.name ?: "Playlist")
         id == COUNTRIES -> folder(COUNTRIES, "Countries")
         id == AZ -> folder(AZ, "All channels")
+        id == LOCAL_SCOPE -> folder(LOCAL_SCOPE, "Local videos")
         id == SELECTED -> folder(SELECTED, "On phone: ${IptvStorage.selection(applicationContext).label}", "Same list as the phone app")
         id.startsWith(CAT_PREFIX) -> folder(id, id.removePrefix(CAT_PREFIX))
         id.startsWith(COUNTRY_PREFIX) -> folder(id, id.removePrefix(COUNTRY_PREFIX))
@@ -745,6 +758,8 @@ class IptvPlaybackService : MediaLibraryService() {
         ).build()
 
     private fun emptyState(parentId: String): MediaItem = when {
+        parentId == LOCAL_SCOPE ->
+            info(parentId, "No local videos", "Add videos in the phone app (Local videos)")
         parentId == PLAYLISTS ->
             info(parentId, "No playlists", "Add a playlist in the phone app")
         IptvStorage.channels(applicationContext).isEmpty() ->
@@ -767,7 +782,15 @@ class IptvPlaybackService : MediaLibraryService() {
         ).build()
 
     private fun channelItem(ch: IptvStorage.Channel, scope: String): MediaItem =
-        MediaItem.Builder()
+        if (scope == LOCAL_SCOPE) MediaItem.Builder()
+            .setMediaId("$CH_PREFIX$scope|${ch.id}")
+            .setUri(ch.url)
+            .setMediaMetadata(
+                MediaMetadata.Builder().setTitle(ch.name).setArtist("Local video")
+                    .setIsBrowsable(false).setIsPlayable(true)
+                    .setMediaType(MediaMetadata.MEDIA_TYPE_VIDEO).build()
+            ).build()
+        else MediaItem.Builder()
             .setMediaId("$CH_PREFIX$scope|${ch.id}")
             .setUri(ch.url)
             .setMediaMetadata(
@@ -808,6 +831,11 @@ class IptvPlaybackService : MediaLibraryService() {
         const val CAT_PREFIX = "cat:"
         const val SEARCH_PREFIX = "search:"
         const val CH_PREFIX = "ch|"
+        /** Scope segment of local-video media ids: ch|local|<id>. */
+        const val LOCAL_SCOPE = "local"
+
+        /** True for a locally selected video (content:// or file:// URI) as opposed to an IPTV channel. */
+        fun isLocal(mediaId: String?): Boolean = mediaId?.startsWith("$CH_PREFIX$LOCAL_SCOPE|") == true
         private const val QUEUE_WINDOW = 100
         private const val MAX_RETRIES = 3
         private const val MAX_AUTO_SKIPS = 5

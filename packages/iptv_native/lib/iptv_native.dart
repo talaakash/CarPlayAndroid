@@ -118,7 +118,17 @@ class NativePlaybackState {
     this.inPictureInPicture = false,
     this.version = 0,
     this.origin = CommandOrigin.phone,
+    this.isLocal = false,
+    this.positionMs = 0,
+    this.durationMs = -1,
   });
+
+  /// True when the current item is a local video (content:// / file:// URI), not an IPTV channel.
+  final bool isLocal;
+  final int positionMs;
+
+  /// -1 when unknown (live streams, not yet loaded).
+  final int durationMs;
 
   final String? channelId;
   final NativePlaybackStatus status;
@@ -151,8 +161,31 @@ class NativePlaybackState {
       inPictureInPicture: m['pip'] as bool? ?? false,
       version: (m['version'] as num?)?.toInt() ?? 0,
       origin: CommandOrigin.parse(m['origin'] as String?),
+      isLocal: m['isLocal'] as bool? ?? false,
+      positionMs: (m['positionMs'] as num?)?.toInt() ?? 0,
+      durationMs: (m['durationMs'] as num?)?.toInt() ?? -1,
     );
   }
+}
+
+/// A video file picked from device storage (metadata only; the bytes stay where they are).
+class PickedVideo {
+  const PickedVideo({required this.uri, required this.name, this.durationMs = -1, this.sizeBytes = -1, this.width = 0, this.height = 0});
+  final String uri;
+  final String name;
+  final int durationMs;
+  final int sizeBytes;
+  final int width;
+  final int height;
+
+  factory PickedVideo.fromMap(Map<Object?, Object?> m) => PickedVideo(
+        uri: m['uri'] as String,
+        name: (m['name'] as String?) ?? 'Video',
+        durationMs: (m['durationMs'] as num?)?.toInt() ?? -1,
+        sizeBytes: (m['sizeBytes'] as num?)?.toInt() ?? -1,
+        width: (m['width'] as num?)?.toInt() ?? 0,
+        height: (m['height'] as num?)?.toInt() ?? 0,
+      );
 }
 
 /// A channel handed to the native engine.
@@ -272,6 +305,37 @@ class IptvNative {
         'channel': channel.toMap(),
         'queue': queue.map((c) => c.toMap()).toList(),
       });
+
+  /// Opens the system file picker (multi-select video). Returns [] when cancelled or unsupported.
+  Future<List<PickedVideo>> pickVideos() async {
+    try {
+      final l = await _method.invokeListMethod<Map<Object?, Object?>>('pickVideos');
+      return [for (final m in l ?? const <Map<Object?, Object?>>[]) PickedVideo.fromMap(m)];
+    } on MissingPluginException {
+      return const [];
+    }
+  }
+
+  /// Name / duration of a previously picked URI, or null when it can no longer be read.
+  Future<PickedVideo?> describeVideo(String uri) async {
+    final m = await _method.invokeMapMethod<Object?, Object?>('describeVideo', {'uri': uri});
+    return m == null ? null : PickedVideo.fromMap(m);
+  }
+
+  /// JPEG thumbnail bytes, or null when there is no decodable frame.
+  Future<Uint8List?> videoThumbnail(String uri) =>
+      _method.invokeMethod<Uint8List>('videoThumbnail', {'uri': uri});
+
+  /// Drops the persisted read grant of a removed library entry.
+  Future<void> releaseVideoUri(String uri) => _method.invokeMethod('releaseVideoUri', {'uri': uri});
+
+  Future<void> seekTo(int positionMs) => _method.invokeMethod('seekTo', {'positionMs': positionMs});
+
+  /// Current position / duration (ms, duration -1 if unknown).
+  Future<({int positionMs, int durationMs})> position() async {
+    final m = await _method.invokeMapMethod<String, Object?>('position');
+    return (positionMs: (m?['positionMs'] as num?)?.toInt() ?? 0, durationMs: (m?['durationMs'] as num?)?.toInt() ?? -1);
+  }
 
   Future<void> resume() => _method.invokeMethod('resume');
   Future<void> pause() => _method.invokeMethod('pause');

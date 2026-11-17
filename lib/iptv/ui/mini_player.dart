@@ -28,7 +28,7 @@ class MiniPlayer extends StatelessWidget {
             : pc.isBuffering
                 ? 'Buffering…'
                 : pc.isPlaying
-                    ? 'Live'
+                    ? (pc.isLocal ? 'Playing local video' : 'Live')
                     : 'Paused';
 
         return Material(
@@ -53,7 +53,7 @@ class MiniPlayer extends StatelessWidget {
                   IconButton(
                     iconSize: big ? 40 : 28,
                     style: big ? IconButton.styleFrom(minimumSize: const Size(64, 64)) : null,
-                    tooltip: 'Previous channel',
+                    tooltip: pc.isLocal ? 'Previous video' : 'Previous channel',
                     icon: const Icon(Icons.skip_previous),
                     onPressed: pc.previous,
                   ),
@@ -67,7 +67,7 @@ class MiniPlayer extends StatelessWidget {
                   IconButton(
                     iconSize: big ? 40 : 28,
                     style: big ? IconButton.styleFrom(minimumSize: const Size(64, 64)) : null,
-                    tooltip: 'Next channel',
+                    tooltip: pc.isLocal ? 'Next video' : 'Next channel',
                     icon: const Icon(Icons.skip_next),
                     onPressed: pc.next,
                   ),

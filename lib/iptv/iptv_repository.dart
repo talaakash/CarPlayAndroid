@@ -13,6 +13,7 @@ import 'core/shared_files.dart';
 import 'services/category_service.dart';
 import 'services/channel_service.dart';
 import 'services/favorite_service.dart';
+import 'services/local_video_service.dart';
 import 'services/player_service.dart';
 import 'services/playback_controller.dart';
 import 'services/player_prefs_service.dart';
@@ -29,6 +30,7 @@ class IPTVRepository extends ChangeNotifier {
       : playlists = PlaylistService(files),
         favorites = FavoriteService(files),
         recents = RecentlyWatchedService(files) {
+    local = LocalVideoService(channels, files);
     player = IPTVPlayerService();
     playback = PlaybackController(player, channels);
     final native = IptvNative.instance;
@@ -47,6 +49,7 @@ class IPTVRepository extends ChangeNotifier {
   final ChannelService channels = ChannelService();
   final CategoryService categories = CategoryService();
   final IPTVSettingsService settings = IPTVSettingsService();
+  late final LocalVideoService local;
   late final IPTVPlayerService player;
   late final PlaybackController playback;
   late final AutomotiveStateSynchronizer automotive;
@@ -87,6 +90,7 @@ class IPTVRepository extends ChangeNotifier {
 
   Future<void> _start() async {
     await settings.load();
+    await local.load();
     automotive.start();
     parked.start();
     prefs.start();
@@ -163,6 +167,7 @@ class IPTVRepository extends ChangeNotifier {
     parked.dispose();
     prefs.dispose();
     playback.dispose();
+    local.dispose();
     playlists.dispose();
     super.dispose();
   }

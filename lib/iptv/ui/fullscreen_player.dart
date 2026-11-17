@@ -5,6 +5,7 @@ import 'package:iptv_native/iptv_native.dart';
 import 'package:material_ui/material_ui.dart';
 
 import '../iptv_repository.dart';
+import '../widgets/local_seek_bar.dart';
 import 'video_view.dart';
 
 /// Landscape full-screen video. Reuses the same native player and view as the normal player;
@@ -94,7 +95,7 @@ class _FullscreenPlayerState extends State<FullscreenPlayer> {
                   child: Column(mainAxisSize: MainAxisSize.min, children: [
                     const Icon(Icons.error_outline, color: Colors.redAccent, size: 40),
                     const SizedBox(height: 4),
-                    const Text('This channel cannot be played right now.', style: TextStyle(color: Colors.white70)),
+                    Text(pc.isLocal ? 'This video cannot be played.' : 'This channel cannot be played right now.', style: TextStyle(color: Colors.white70)),
                     TextButton(onPressed: pc.retry, child: const Text('Retry')),
                   ]),
                 ),
@@ -132,7 +133,7 @@ class _FullscreenPlayerState extends State<FullscreenPlayer> {
                                     overflow: TextOverflow.ellipsis,
                                     style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w600)),
                               ),
-                              if (ch != null)
+                              if (ch != null && !pc.isLocal)
                                 IconButton(
                                   tooltip: 'Favorite',
                                   color: Colors.white,
@@ -166,6 +167,9 @@ class _FullscreenPlayerState extends State<FullscreenPlayer> {
                           child: Padding(
                             padding: const EdgeInsets.fromLTRB(16, 24, 16, 8),
                             child: Column(mainAxisSize: MainAxisSize.min, children: [
+                              if (pc.isLocal)
+                                LocalSeekBar(playback: pc, onDark: true)
+                              else
                               // Live stream: a full, non-seekable bar.
                               Row(children: [
                                 const Icon(Icons.circle, color: Colors.redAccent, size: 10),
@@ -186,7 +190,7 @@ class _FullscreenPlayerState extends State<FullscreenPlayer> {
                               ]),
                               Row(mainAxisAlignment: MainAxisAlignment.center, children: [
                                 IconButton(
-                                  tooltip: 'Previous channel',
+                                  tooltip: pc.isLocal ? 'Previous video' : 'Previous channel',
                                   color: Colors.white,
                                   iconSize: 36,
                                   icon: const Icon(Icons.skip_previous),
@@ -202,7 +206,7 @@ class _FullscreenPlayerState extends State<FullscreenPlayer> {
                                 ),
                                 const SizedBox(width: 24),
                                 IconButton(
-                                  tooltip: 'Next channel',
+                                  tooltip: pc.isLocal ? 'Next video' : 'Next channel',
                                   color: Colors.white,
                                   iconSize: 36,
                                   icon: const Icon(Icons.skip_next),

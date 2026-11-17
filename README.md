@@ -184,6 +184,29 @@ Check: open the app once on the phone so the playlist loads; in the head unit br
 Favorites, Recent; play a channel; go back and play another; Play/Pause/Next/Previous; the heart button;
 search; open the car video screen and set speed to 0 in the sensor panel; disconnect and reconnect.
 
+## Local videos
+
+Play video files from the phone's storage through the same player, output selector and Android Auto video screen as IPTV channels.
+
+**Using it.** Home screen → the video-library icon in the app bar → **Add videos** (system file picker, multi-select; MP4, MKV, MOV, WebM, 3GP … anything ExoPlayer can decode). The library shows thumbnail, name, duration and size. Tap a video to play it; the whole library becomes the queue, so Next / Previous (and automatic advance at the end of a file) step through the files. The player screen shows a seek bar, ±10 s buttons and the usual **Play video on: Mobile / Android Auto** selector; the mini-player and full-screen player work as for channels. Remove an entry with the trash icon.
+
+**Architecture.** There is no second player. A local video is just a `MediaItem` with a `content://` URI queued into the one `ExoPlayer` owned by `IptvPlaybackService`:
+
+* Dart: `LocalVideo.toChannel()` produces a normal `Channel` whose `url` is the URI, so `IptvNative.play(channel, queue)` is reused unchanged. `ChannelService.setLocal` makes the id resolvable by `PlaybackController.current` without adding it to the IPTV list.
+* Native: `IptvNativePlugin.toItem` recognises `content://` / `file://` URLs and builds the item with media id `ch|local|<id>` (`IptvPlaybackService.isLocal`). The service then treats it as non-live: seek commands stay available (they are removed for live IPTV), the stall watchdog (which reloads at the "live edge") skips it, it is not added to IPTV Recents and has no favorite button.
+* `DefaultMediaSourceFactory` now uses `DefaultDataSource.Factory(context, httpFactory)` so `content://` URIs are readable alongside http(s); IPTV behaviour is unchanged.
+* The state event carries `isLocal`, `positionMs`, `durationMs`; Dart polls `position` (500 ms) only while a seek bar is on screen, and `seekTo` seeks the shared player.
+
+**Android Auto browsing.** Dart publishes the library to `local_videos.json` (shared directory, Dart is the only writer) and calls `dataChanged`; `IptvPlaybackService` serves it as a **Local videos** folder on the car's home list (`IptvStorage.localVideos`), and picking one queues the whole folder under the `local` scope.
+
+**Output handling.** Unchanged: the native `output` setting (phone / car) decides who owns the video Surface. The car overlay (`CarPlayerUi`) shows Play/Pause, Previous, Next, Fit/Fill and, for local videos, elapsed time, a tap-to-seek progress bar and total time instead of the LIVE bar (favorite is hidden). Switching output only moves the Surface, so playback and position are preserved. When Android Auto disconnects, `videoOnCar` goes false and the phone shows the video again; on reconnect the car session re-attaches its Surface to the running player.
+
+**Storage permissions and URIs.** The picker is the Storage Access Framework (`ACTION_OPEN_DOCUMENT`), so **no storage permission is requested** (no `READ_EXTERNAL_STORAGE` / `READ_MEDIA_VIDEO`). The app takes a persistable read grant (`takePersistableUriPermission`) per file and stores only URI + metadata in SharedPreferences (`local_videos`); files are never copied. Removing an entry releases the grant. If a file is later moved or deleted, playback shows the error state ("This video cannot be played") with Retry / Next; unsupported or corrupt files surface the same way via `onPlayerError`.
+
+**Key files.** `lib/iptv/core/local_video.dart`, `lib/iptv/services/local_video_service.dart`, `lib/iptv/ui/local_videos_screen.dart`, `lib/iptv/widgets/local_seek_bar.dart`; `packages/iptv_native/lib/iptv_native.dart` (`pickVideos`, `seekTo`, `position`, `videoThumbnail`); `IptvNativePlugin.kt` (picker, metadata, thumbnails, `toItem`); `IptvPlaybackService.kt` (`isLocal`, data source, seek/watchdog rules); `CarPlayerUi.kt` / `CarVideoService.kt` (progress bar, tap-to-seek).
+
+**Status.** Dart analysis and unit tests pass and the debug APK builds. The on-device / Android Auto scenarios (mobile and car playback, output switching, seeking, sequential play, bad files, disconnect/reconnect, IPTV regression) have **not yet been run** — no device was connected when this was implemented.
+
 ## 11. Limitations
 
 - Android Auto's media UI is lists only: no keyboard entry, settings screens or folder icons. Adding playlists

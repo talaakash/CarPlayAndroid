@@ -96,6 +96,12 @@ object IptvStorage {
         cachedChannels
     }
 
+    /** Local videos picked on the phone (local_videos.json, written by Dart). url = content:// URI. */
+    fun localVideos(context: Context): List<Channel> = synchronized(lock) {
+        val f = file(context, "local_videos.json")
+        if (f.exists()) parseChannels(f) else emptyList()
+    }
+
     fun channelById(context: Context, id: String): Channel? {
         channels(context)
         return synchronized(lock) { cachedById[id] }

@@ -5,6 +5,8 @@ import android.app.Activity
 import android.app.PictureInPictureParams
 import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
@@ -60,6 +62,10 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
     private var videoSize = VideoSize.UNKNOWN
     private var stateVersion = 0L
 
+    // Local videos: file picker result + background metadata / thumbnail work.
+    private var pendingPick: MethodChannel.Result? = null
+    private val ioPool = java.util.concurrent.Executors.newFixedThreadPool(2)
+
     // Platform-confirmed car connection (null until the platform answered).
     private var carConnection: CarConnection? = null
     private var connectionType: Int? = null
@@ -108,11 +114,21 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
         controller?.release()
         controller = null
         controllerBuilding = false
+        ioPool.shutdown()
+        pendingPick?.success(emptyList<Any>())
+        pendingPick = null
         if (instance === this) instance = null
     }
 
-    private fun attach(b: ActivityPluginBinding) { activity = b.activity; binding = b }
-    private fun detach() { binding = null; activity = null }
+    private fun attach(b: ActivityPluginBinding) {
+        binding?.removeActivityResultListener(pickResultListener)
+        activity = b.activity; binding = b
+        b.addActivityResultListener(pickResultListener)
+    }
+    private fun detach() {
+        binding?.removeActivityResultListener(pickResultListener)
+        binding = null; activity = null
+    }
 
     override fun onAttachedToActivity(binding: ActivityPluginBinding) = attach(binding)
     override fun onDetachedFromActivityForConfigChanges() = detach()
@@ -207,6 +223,9 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
             "videoWidth" to (videoSize.width * videoSize.pixelWidthHeightRatio).toInt(),
             "videoHeight" to videoSize.height,
             "pip" to inPip,
+            "isLocal" to IptvPlaybackService.isLocal(c?.currentMediaItem?.mediaId),
+            "positionMs" to (c?.currentPosition?.coerceAtLeast(0L) ?: 0L),
+            "durationMs" to (c?.duration?.takeIf { it != C.TIME_UNSET } ?: -1L),
             "version" to ++stateVersion,
             "origin" to IptvPlaybackService.lastOrigin,
         )
@@ -292,6 +311,40 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
                 withController { it.seekToDefaultPosition(); it.prepare(); it.play() }
                 result.success(null)
             }
+            "seekTo" -> {
+                val ms = (call.argument<Number>("positionMs") ?: 0).toLong()
+                withController { it.seekTo(ms.coerceAtLeast(0L)) }
+                result.success(null)
+            }
+            "position" -> {
+                val c = controller
+                result.success(mapOf(
+                    "positionMs" to (c?.currentPosition?.coerceAtLeast(0L) ?: 0L),
+                    "durationMs" to (c?.duration?.takeIf { it != C.TIME_UNSET } ?: -1L),
+                    "bufferedMs" to (c?.bufferedPosition ?: 0L),
+                ))
+            }
+            "pickVideos" -> pickVideos(result)
+            "videoThumbnail" -> {
+                val uri = call.argument<String>("uri")
+                if (uri == null) { result.success(null) } else {
+                    runIo(result) { videoThumbnail(Uri.parse(uri)) }
+                }
+            }
+            "describeVideo" -> {
+                val uri = call.argument<String>("uri")
+                if (uri == null) { result.success(null) } else {
+                    runIo(result) { describeVideo(Uri.parse(uri)) }
+                }
+            }
+            "releaseVideoUri" -> {
+                call.argument<String>("uri")?.let {
+                    try {
+                        appContext.contentResolver.releasePersistableUriPermission(Uri.parse(it), Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    } catch (_: Throwable) {}
+                }
+                result.success(null)
+            }
             "parkedVideo" -> result.success(ParkedVideoPolicy.toMap())
             "debugSimulateDriving" -> {
                 val mode = when (call.argument<String>("mode")) {
@@ -350,10 +403,27 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
     }
 
     private fun toItem(m: Map<String, Any?>): MediaItem {
+        val url = m["url"] as String
+        // A content:// or file:// URI is a local video: same engine, same queue, but a distinct
+        // scope so the service can treat it as seekable / non-live / not an IPTV recent.
+        if (url.startsWith("content://") || url.startsWith("file://")) {
+            return MediaItem.Builder()
+                .setMediaId("${IptvPlaybackService.CH_PREFIX}${IptvPlaybackService.LOCAL_SCOPE}|${m["id"]}")
+                .setUri(url)
+                .setMediaMetadata(
+                    MediaMetadata.Builder()
+                        .setTitle(m["name"] as? String)
+                        .setArtist("Local video")
+                        .setIsPlayable(true)
+                        .setIsBrowsable(false)
+                        .setMediaType(MediaMetadata.MEDIA_TYPE_VIDEO)
+                        .build()
+                ).build()
+        }
         val logo = (m["logo"] as? String).orEmpty()
         return MediaItem.Builder()
             .setMediaId("${IptvPlaybackService.CH_PREFIX}ui|${m["id"]}")
-            .setUri(m["url"] as String)
+            .setUri(url)
             .setMediaMetadata(
                 MediaMetadata.Builder()
                     .setTitle(m["name"] as? String)
@@ -364,6 +434,107 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
                     .setMediaType(MediaMetadata.MEDIA_TYPE_RADIO_STATION)
                     .build()
             ).build()
+    }
+
+    // ---- Local videos (Storage Access Framework: no storage permission needed) -------------
+
+    /** Runs [work] off the main thread and posts its value back as the method result. */
+    private fun runIo(result: MethodChannel.Result, work: () -> Any?) {
+        try {
+            ioPool.execute {
+                val v = try { work() } catch (_: Throwable) { null }
+                main.post { result.success(v) }
+            }
+        } catch (_: java.util.concurrent.RejectedExecutionException) { result.success(null) }
+    }
+
+    /**
+     * System document picker (ACTION_OPEN_DOCUMENT, any video MIME type, multi-select). The user browses any
+     * storage / cloud provider; the app gets a read grant that we persist so the library survives
+     * restarts. No READ_EXTERNAL_STORAGE / READ_MEDIA_VIDEO permission is required.
+     */
+    private fun pickVideos(result: MethodChannel.Result) {
+        val a = activity
+        if (a == null) { result.error("no_activity", "No foreground activity", null); return }
+        if (pendingPick != null) { result.error("busy", "A picker is already open", null); return }
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "video/*"
+            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+        }
+        pendingPick = result
+        try { a.startActivityForResult(intent, REQ_PICK_VIDEOS) }
+        catch (e: Exception) { pendingPick = null; result.error("no_picker", e.message, null) }
+    }
+
+    private val pickResultListener = io.flutter.plugin.common.PluginRegistry.ActivityResultListener { req, code, data ->
+        if (req != REQ_PICK_VIDEOS) return@ActivityResultListener false
+        val res = pendingPick ?: return@ActivityResultListener true
+        pendingPick = null
+        val uris = ArrayList<Uri>()
+        if (code == Activity.RESULT_OK && data != null) {
+            data.clipData?.let { cd -> for (i in 0 until cd.itemCount) uris.add(cd.getItemAt(i).uri) }
+            if (uris.isEmpty()) data.data?.let { uris.add(it) }
+        }
+        for (u in uris) {
+            try {
+                appContext.contentResolver.takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            } catch (_: Throwable) { /* provider without persistable grants: usable until restart */ }
+        }
+        runIo(res) { uris.map { describeVideo(it) } }
+        true
+    }
+
+    private fun describeVideo(uri: Uri): Map<String, Any?> {
+        var name: String? = null
+        var size = -1L
+        try {
+            appContext.contentResolver.query(uri, null, null, null, null)?.use { c ->
+                if (c.moveToFirst()) {
+                    c.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME).takeIf { it >= 0 }?.let { name = c.getString(it) }
+                    c.getColumnIndex(android.provider.OpenableColumns.SIZE).takeIf { it >= 0 && !c.isNull(it) }?.let { size = c.getLong(it) }
+                }
+            }
+        } catch (_: Throwable) {}
+        var duration = -1L
+        var w = 0
+        var h = 0
+        val r = android.media.MediaMetadataRetriever()
+        try {
+            r.setDataSource(appContext, uri)
+            duration = r.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: -1L
+            w = r.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: 0
+            h = r.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: 0
+        } catch (_: Throwable) {} finally { try { r.release() } catch (_: Throwable) {} }
+        return mapOf(
+            "uri" to uri.toString(),
+            "name" to (name ?: uri.lastPathSegment ?: "Video"),
+            "durationMs" to duration, "sizeBytes" to size, "width" to w, "height" to h,
+        )
+    }
+
+    /** JPEG thumbnail (about 320 px wide) or null when the file has no decodable frame. */
+    private fun videoThumbnail(uri: Uri): ByteArray? {
+        var bmp: android.graphics.Bitmap? = null
+        if (Build.VERSION.SDK_INT >= 29) {
+            try { bmp = appContext.contentResolver.loadThumbnail(uri, android.util.Size(320, 320), null) } catch (_: Throwable) {}
+        }
+        if (bmp == null) {
+            val r = android.media.MediaMetadataRetriever()
+            try {
+                r.setDataSource(appContext, uri)
+                bmp = r.getFrameAtTime(1_000_000L, android.media.MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                    ?: r.getFrameAtTime()
+            } catch (_: Throwable) {} finally { try { r.release() } catch (_: Throwable) {} }
+        }
+        val b = bmp ?: return null
+        val scaled = if (b.width > 320) {
+            android.graphics.Bitmap.createScaledBitmap(b, 320, (b.height * 320f / b.width).toInt().coerceAtLeast(1), true)
+        } else b
+        val out = java.io.ByteArrayOutputStream()
+        scaled.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, out)
+        return out.toByteArray()
     }
 
     private fun requestNotificationPermission() {
@@ -445,6 +616,7 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
 
     companion object {
         private const val WINDOW = 100
+        private const val REQ_PICK_VIDEOS = 7302
         private var instance: IptvNativePlugin? = null
 
         /** Called from MainActivity.onPictureInPictureModeChanged. */

@@ -25,6 +25,8 @@ class IPTVPlayerService {
   Future<void> next() => _native.next();
   Future<void> previous() => _native.previous();
   Future<void> retry() => _native.retry();
+  Future<void> seekTo(int ms) => _native.seekTo(ms);
+  Future<({int positionMs, int durationMs})> position() => _native.position();
 
   Future<bool> pipSupported() => _native.isPictureInPictureSupported();
   Future<void> enterPip() => _native.enterPictureInPicture();

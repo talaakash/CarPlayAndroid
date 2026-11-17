@@ -5,14 +5,20 @@ class ChannelService {
   List<Channel> _channels = const [];
   Map<String, Channel> _byId = const {};
 
+  /// Local videos: resolvable by id (so the shared player shows them) but never part of the IPTV list.
+  Map<String, Channel> _local = const {};
+
   List<Channel> get all => _channels;
+
+  void setLocal(List<Channel> videos) => _local = {for (final c in videos) c.id: c};
+  bool isLocal(String id) => _local.containsKey(id);
 
   void setChannels(List<Channel> channels) {
     _channels = channels;
     _byId = {for (final c in channels) c.id: c};
   }
 
-  Channel? byId(String id) => _byId[id];
+  Channel? byId(String id) => _byId[id] ?? _local[id];
 
   List<Channel> byIds(Iterable<String> ids) =>
       [for (final id in ids) if (_byId[id] != null) _byId[id]!];
