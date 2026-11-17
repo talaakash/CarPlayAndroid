@@ -32,6 +32,27 @@ import java.util.concurrent.TimeUnit
  * output is just a surface swap, and Fit/Fill is a uniform change that redraws the last frame.
  */
 class CarVideoRenderer(private val target: Surface) {
+    companion object {
+        /** A side inset must cover at least this share of the surface width to count as a pane. */
+        const val MIN_PANE_FRACTION = 0.2f
+
+        /**
+         * Scale of the full-area quad that shows a picture of aspect [pictureAspect] inside an
+         * area of aspect [areaAspect]: Fit = whole picture inside (bars), Fill = covers (crops).
+         */
+        fun quadScale(pictureAspect: Float, areaAspect: Float, fill: Boolean): Pair<Float, Float> {
+            val wide = pictureAspect > areaAspect
+            return if (!fill) {
+                if (wide) 1f to areaAspect / pictureAspect else pictureAspect / areaAspect to 1f
+            } else {
+                if (wide) pictureAspect / areaAspect to 1f else 1f to areaAspect / pictureAspect
+            }
+        }
+    }
+
+    /** Part of the Surface that is actually visible (not under a secondary pane); null = all of it. */
+    @Volatile private var area: android.graphics.Rect? = null
+
     private val thread = HandlerThread("car-video-gl").also { it.start() }
     private val handler = Handler(thread.looper)
 
@@ -50,6 +71,8 @@ class CarVideoRenderer(private val target: Surface) {
     private var imgMvp = 0
     private var imgTex = 0
     private var hasImage = false
+    private var overlayTex = 0
+    private var hasOverlay = false
 
     private val texMatrix = FloatArray(16)
     private val mvp = FloatArray(16)
@@ -119,6 +142,14 @@ class CarVideoRenderer(private val target: Surface) {
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
         GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        val ot = IntArray(1)
+        GLES20.glGenTextures(1, ot, 0)
+        overlayTex = ot[0]
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, overlayTex)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
         uMvp = GLES20.glGetUniformLocation(program, "uMvp")
         uTex = GLES20.glGetUniformLocation(program, "uTex")
         val t = IntArray(1)
@@ -175,10 +206,55 @@ class CarVideoRenderer(private val target: Surface) {
         }
     }
 
+    /**
+     * Status banner (buffering, error...) drawn ON TOP of the picture, inside the same Surface.
+     * Because it is part of the frame and not a host UI panel, it never changes the visible area
+     * and so never resizes the video. Pass null to remove it. Takes ownership of [bmp].
+     */
+    fun setOverlay(bmp: Bitmap?) {
+        handler.post {
+            if (released) { bmp?.recycle(); return@post }
+            if (bmp == null) hasOverlay = false else {
+                try {
+                    GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, overlayTex)
+                    GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
+                    hasOverlay = true
+                } catch (_: Throwable) {} finally { bmp.recycle() }
+            }
+            draw(newFrame = false)
+        }
+    }
+
     /** Video size with pixel aspect applied; 0 = unknown (then the picture is simply filled). */
     fun setVideoSize(width: Float, height: Float) {
         videoWidth = width; videoHeight = height
         handler.post { draw(newFrame = false) }
+    }
+
+    /** The host reported which part of the Surface is visible; everything is laid out inside it. */
+    fun setVisibleArea(rect: android.graphics.Rect?) {
+        area = rect?.takeIf { it.width() > 0 && it.height() > 0 }?.let { android.graphics.Rect(it) }
+        handler.post { draw(newFrame = false) }
+    }
+
+    /** Current drawing area in surface pixels (visible area clamped to the Surface, else all of it). */
+    fun areaSize(): Pair<Int, Int> {
+        val r = clampedArea(width, height)
+        return (r?.width() ?: width) to (r?.height() ?: height)
+    }
+
+    private fun clampedArea(w: Int, h: Int): android.graphics.Rect? {
+        val a = area ?: return null
+        // Only a secondary pane may resize the picture. It takes a big slice of the width, while the
+        // host's own controls (the map-action-strip rail with Favorite / Fit / Fill, the action
+        // strip, the message panel) are small and sit on top of the picture, so side insets below
+        // MIN_PANE_FRACTION of the width are ignored. Height is never reduced.
+        val minInset = (w * MIN_PANE_FRACTION).toInt()
+        val left = if (a.left >= minInset) a.left else 0
+        val right = if (w - a.right >= minInset) a.right else w
+        val r = android.graphics.Rect(left, 0, right, h)
+        if (!r.intersect(0, 0, w, h) || r.width() <= 0) return null
+        return r
     }
 
     fun setFill(value: Boolean) {
@@ -198,29 +274,27 @@ class CarVideoRenderer(private val target: Surface) {
             EGL14.eglQuerySurface(display, eglSurface, EGL14.EGL_WIDTH, w, 0)
             EGL14.eglQuerySurface(display, eglSurface, EGL14.EGL_HEIGHT, h, 0)
             if (w[0] <= 0 || h[0] <= 0) return
+            GLES20.glDisable(GLES20.GL_SCISSOR_TEST)
             GLES20.glViewport(0, 0, w[0], h[0])
             GLES20.glClearColor(0f, 0f, 0f, 1f)
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT)
+            // Lay out inside the visible area only (GL origin is bottom-left); the scissor makes
+            // Fill crop at the pane edge instead of drawing under the secondary pane.
+            val vr = clampedArea(w[0], h[0])
+            val vx = vr?.left ?: 0
+            val vy = if (vr != null) h[0] - vr.bottom else 0
+            val vw = vr?.width() ?: w[0]
+            val vh = vr?.height() ?: h[0]
+            GLES20.glViewport(vx, vy, vw, vh)
+            GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
+            GLES20.glScissor(vx, vy, vw, vh)
             if (!showingVideo) {
-                if (hasImage) {
-                    android.opengl.Matrix.setIdentityM(mvp, 0)
-                    GLES20.glUseProgram(imgProgram)
-                    GLES20.glUniformMatrix4fv(imgMvp, 1, false, mvp, 0)
-                    GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-                    GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, imgTex)
-                    val aPos = GLES20.glGetAttribLocation(imgProgram, "aPos")
-                    val aUv = GLES20.glGetAttribLocation(imgProgram, "aUv")
-                    GLES20.glEnableVertexAttribArray(aPos); GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 0, quad)
-                    GLES20.glEnableVertexAttribArray(aUv); GLES20.glVertexAttribPointer(aUv, 2, GLES20.GL_FLOAT, false, 0, uvFlipped)
-                    GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
-                }
+                if (hasImage) drawImage(imgTex)
             } else if (hasFrame) {
-                val sa = w[0].toFloat() / h[0]
+                val sa = vw.toFloat() / vh
                 val va = if (videoWidth > 0 && videoHeight > 0) videoWidth / videoHeight else sa
                 // Fit: shrink the quad so the whole picture is inside. Fill: grow it to cover.
-                val sx: Float; val sy: Float
-                if (!fill) { sx = if (va > sa) 1f else va / sa; sy = if (va > sa) sa / va else 1f }
-                else { sx = if (va > sa) va / sa else 1f; sy = if (va > sa) 1f else sa / va }
+                val (sx, sy) = quadScale(va, sa, fill)
                 android.opengl.Matrix.setIdentityM(mvp, 0)
                 android.opengl.Matrix.scaleM(mvp, 0, sx, sy, 1f)
                 GLES20.glUseProgram(program)
@@ -234,8 +308,27 @@ class CarVideoRenderer(private val target: Surface) {
                 GLES20.glEnableVertexAttribArray(aUv); GLES20.glVertexAttribPointer(aUv, 2, GLES20.GL_FLOAT, false, 0, uv)
                 GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
             }
+            if (hasOverlay) {
+                GLES20.glEnable(GLES20.GL_BLEND)
+                GLES20.glBlendFunc(GLES20.GL_ONE, GLES20.GL_ONE_MINUS_SRC_ALPHA) // bitmap is premultiplied
+                drawImage(overlayTex)
+                GLES20.glDisable(GLES20.GL_BLEND)
+            }
             EGL14.eglSwapBuffers(display, eglSurface)
         } catch (_: Throwable) { /* surface gone: the session will release us */ }
+    }
+
+    private fun drawImage(tex: Int) {
+        android.opengl.Matrix.setIdentityM(mvp, 0)
+        GLES20.glUseProgram(imgProgram)
+        GLES20.glUniformMatrix4fv(imgMvp, 1, false, mvp, 0)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, tex)
+        val aPos = GLES20.glGetAttribLocation(imgProgram, "aPos")
+        val aUv = GLES20.glGetAttribLocation(imgProgram, "aUv")
+        GLES20.glEnableVertexAttribArray(aPos); GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 0, quad)
+        GLES20.glEnableVertexAttribArray(aUv); GLES20.glVertexAttribPointer(aUv, 2, GLES20.GL_FLOAT, false, 0, uvFlipped)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
     }
 
     /** Call after the player stopped using [inputSurface]. Frees GL resources asynchronously. */

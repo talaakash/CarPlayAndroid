@@ -81,6 +81,8 @@ private class CarVideoSession : Session() {
     private var browser: MediaBrowser? = null
     /** GL owner of the host Surface (video and artwork both go through it). */
     private var renderer: CarVideoRenderer? = null
+    /** Unobscured part of the Surface, reported live by the host (shrinks when a secondary pane is shown). */
+    private var visibleArea: android.graphics.Rect? = null
     private var attached = false
     /** true = moving, false = stopped, null = unknown. */
     private var moving: Boolean? = null
@@ -100,13 +102,34 @@ private class CarVideoSession : Session() {
         override fun onSurfaceAvailable(surfaceContainer: SurfaceContainer) {
             dropRenderer()
             surfaceContainer.surface?.let { renderer = CarVideoRenderer(it).takeIf { r -> r.inputSurface != null } }
+            renderer?.setVisibleArea(effectiveArea()) // the area callback may have arrived first
             sync()
+        }
+
+        override fun onVisibleAreaChanged(visibleArea: android.graphics.Rect) {
+            this@CarVideoSession.visibleArea = android.graphics.Rect(visibleArea)
+            areaChanged()
         }
 
         override fun onSurfaceDestroyed(surfaceContainer: SurfaceContainer) {
             dropRenderer()
             sync()
         }
+    }
+
+    /**
+     * The visible area the host reported (it shrinks when a secondary pane is shown), else the whole
+     * Surface (null). The stable area is deliberately ignored: it also excludes the action strip, and
+     * our controls overlay the picture. The renderer also keeps the full height (see CarVideoRenderer.clampedArea).
+     */
+    private fun effectiveArea() = visibleArea?.takeIf { !it.isEmpty }
+
+    /** A pane was shown / hidden: the picture re-lays out inside the new area; the player is untouched. */
+    private fun areaChanged() {
+        val r = renderer ?: return
+        r.setVisibleArea(effectiveArea())
+        if (!attached) drawArtwork(r) // artwork re-centres in the uncovered region
+        updateOverlay()
     }
 
     private fun dropRenderer() {
@@ -139,14 +162,48 @@ private class CarVideoSession : Session() {
             attached = false
         }
         if (!attached && r != null) drawArtwork(r)
+        updateOverlay()
+    }
+
+    /** What the user needs to know right now, or null when video / artwork is simply showing. */
+    private fun statusMessage(): Pair<String, String>? {
+        val c = browser ?: return "Connecting…" to "Starting the player"
+        val name = c.currentMediaItem?.mediaMetadata?.title?.toString()
+        val onCar = outputIsCar()
+        return when {
+            c.playerError != null ->
+                "Can't play ${name ?: "this channel"}" to
+                    ((c.playerError?.errorCodeName ?: "Stream error") + " – try Next or pick another channel")
+            c.mediaItemCount == 0 ->
+                "No channel playing" to "Tap the list button to choose a channel"
+            onCar && moving == true -> "Video paused while driving" to "Audio keeps playing"
+            onCar && moving == null && !videoAllowed() -> "Video unavailable" to "Vehicle speed is not available – audio only"
+            c.playbackState == Player.STATE_BUFFERING -> "Buffering…" to (name ?: "")
+            else -> null
+        }
+    }
+
+
+    private var overlayKey = ""
+
+    /** Draws the status (buffering, error, driving...) over the picture instead of a host banner. */
+    private fun updateOverlay() {
+        val r = renderer ?: return
+        val m = statusMessage()
+        val (aw, ah) = r.areaSize()
+        val key = "$m|$aw|$ah"
+        if (key == overlayKey) return
+        overlayKey = key
+        r.setOverlay(if (m == null) null else artwork.renderBanner(aw, ah, m.first, m.second))
     }
 
     /** Artwork + channel name on the car surface while the video plays on the phone. */
     private fun drawArtwork(r: CarVideoRenderer) {
         val md = browser?.currentMediaItem?.mediaMetadata
         val url = md?.artworkUri?.toString()
+        val (aw, ah) = r.areaSize()
         artwork.render(
-            r.width, r.height,
+            aw, ah,
             md?.title?.toString() ?: "No channel playing",
             md?.artist?.toString().orEmpty(),
             url,
@@ -182,6 +239,7 @@ private class CarVideoSession : Session() {
                 override fun onEvents(player: Player, events: Player.Events) {
                     invalidateTop()
                     if (!attached) renderer?.let { drawArtwork(it) }
+                    updateOverlay()
                 }
             })
             sync()
@@ -229,24 +287,6 @@ private class CarVideoSession : Session() {
     // ---- Player screen --------------------------------------------------------------
 
     private inner class VideoScreen(ctx: CarContext) : Screen(ctx) {
-        /** What the user needs to know right now, or null when video / artwork is simply showing. */
-        private fun message(): Pair<String, String>? {
-            val c = browser ?: return "Connecting…" to "Starting the player"
-            val name = c.currentMediaItem?.mediaMetadata?.title?.toString()
-            val onCar = outputIsCar()
-            return when {
-                c.playerError != null ->
-                    "Can't play ${name ?: "this channel"}" to
-                        ((c.playerError?.errorCodeName ?: "Stream error") + " – try Next or pick another channel")
-                c.mediaItemCount == 0 ->
-                    "No channel playing" to "Tap the list button to choose a channel"
-                onCar && moving == true -> "Video paused while driving" to "Audio keeps playing"
-                onCar && moving == null && !videoAllowed() -> "Video unavailable" to "Vehicle speed is not available – audio only"
-                c.playbackState == Player.STATE_BUFFERING -> "Buffering…" to (name ?: "")
-                else -> null
-            }
-        }
-
         private fun currentChannelId() =
             browser?.currentMediaItem?.mediaId?.let(IptvPlaybackService::parseChannelId)
 
@@ -280,9 +320,9 @@ private class CarVideoSession : Session() {
                 })
             }
             builder.setMapActionStrip(mapActions.build())
-            message()?.let { (title, text) ->
-                builder.setNavigationInfo(MessageInfo.Builder(title).setText(text).build())
-            }
+            // No host message panel: it would shrink the visible area and with it the video.
+            // Status is drawn over the picture by the renderer (see updateOverlay).
+            updateOverlay()
             return builder.build()
         }
     }
@@ -497,6 +537,29 @@ private class CarArtwork {
                 canvas.drawText(ellipsize(subtitle, sub, w * 0.8f), cx, ty + sub.textSize * 1.5f, sub)
             }
         }
+        return out
+    }
+
+    /** Transparent bitmap with a translucent status banner at the top centre (title + text). */
+    fun renderBanner(w: Int, h: Int, title: String, text: String): Bitmap? {
+        if (w <= 0 || h <= 0) return null
+        val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(out)
+        val tp = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.WHITE; textSize = h * 0.055f; typeface = Typeface.DEFAULT_BOLD; textAlign = Paint.Align.CENTER
+        }
+        val sp = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = 0xFFCFD8DC.toInt(); textSize = h * 0.042f; textAlign = Paint.Align.CENTER
+        }
+        val maxW = w * 0.7f
+        val t = ellipsize(title, tp, maxW - 48f)
+        val x = ellipsize(text, sp, maxW - 48f)
+        val boxH = tp.textSize * 1.6f + (if (x.isNotBlank()) sp.textSize * 1.5f else 0f) + 24f
+        val box = RectF(w / 2f - maxW / 2f, h * 0.06f, w / 2f + maxW / 2f, h * 0.06f + boxH)
+        canvas.drawRoundRect(box, 20f, 20f, Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xCC000000.toInt() })
+        var y = box.top + 12f + tp.textSize * 1.1f
+        canvas.drawText(t, w / 2f, y, tp)
+        if (x.isNotBlank()) { y += sp.textSize * 1.5f; canvas.drawText(x, w / 2f, y, sp) }
         return out
     }
 
