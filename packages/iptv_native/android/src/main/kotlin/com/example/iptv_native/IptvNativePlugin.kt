@@ -67,6 +67,7 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
     private val ioPool = java.util.concurrent.Executors.newFixedThreadPool(2)
 
     // Platform-confirmed car connection (null until the platform answered).
+    private var debugReceiver: android.content.BroadcastReceiver? = null
     private var carConnection: CarConnection? = null
     private var connectionType: Int? = null
     private val connectionObserver = Observer<Int> { type ->
@@ -95,6 +96,22 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
         IptvStorage.onSelectionChanged = { sel -> main.post { emit(selectionMap(sel)) } }
         IptvPlaybackService.onCarSurfaceCleared = { main.post { reattachPhoneVideo() } }
         IptvStorage.addChangeListener(changeListener)
+        CarBrowserBridge.onState = { st -> main.post { emit(carBrowserMap(st)) } }
+        BrowserHistory.addListener(historyListener)
+        // Debug builds only: `adb shell am broadcast -a com.example.car_play.DEBUG_SEND_URL --es url <url>`
+        // runs the same path as the Send to Car button (used to test without touching the phone).
+        if (appContext.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+            debugReceiver = object : android.content.BroadcastReceiver() {
+                override fun onReceive(c: Context, i: Intent) {
+                    val r = CarBrowserBridge.send(i.getStringExtra("url"), carConnected())
+                    android.util.Log.i("CarBrowser", "debug send -> $r")
+                    if (r == CarBrowserBridge.SENT) CarBrowserBridge.awaitConfirm(6_000) { android.util.Log.i("CarBrowser", "debug send confirmed -> $it") }
+                }
+            }
+            androidx.core.content.ContextCompat.registerReceiver(appContext, debugReceiver,
+                android.content.IntentFilter("com.example.car_play.DEBUG_SEND_URL"),
+                androidx.core.content.ContextCompat.RECEIVER_EXPORTED)
+        }
         carConnection = CarConnection(appContext).also { it.type.observeForever(connectionObserver) }
         withController { }  // connect early so state is available to Flutter
     }
@@ -107,6 +124,10 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
         IptvStorage.onSelectionChanged = null
         IptvPlaybackService.onCarSurfaceCleared = null
         IptvStorage.removeChangeListener(changeListener)
+        CarBrowserBridge.onState = null
+        BrowserHistory.removeListener(historyListener)
+        debugReceiver?.let { try { appContext.unregisterReceiver(it) } catch (_: Throwable) {} }
+        debugReceiver = null
         carConnection?.type?.removeObserver(connectionObserver)
         carConnection = null
         // The service (and its playback) keeps running; only release our controller.
@@ -265,6 +286,30 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
         "version" to sel.version, "origin" to sel.origin,
     )
 
+    private val historyListener: () -> Unit = { main.post { emit(mapOf("type" to "browserHistory")) } }
+
+    private fun historyList() = BrowserHistory.list(appContext).map { mapOf("u" to it.url, "t" to it.title, "at" to it.time) }
+
+    private fun carBrowserMap(s: CarBrowserBridge.State) = mapOf(
+        "type" to "carBrowser", "open" to s.open, "url" to s.url, "title" to s.title, "loading" to s.loading,
+    )
+
+    private fun carConnected() =
+        connectionType == CarConnection.CONNECTION_TYPE_PROJECTION || connectionType == CarConnection.CONNECTION_TYPE_NATIVE
+
+    /** Non-web links (tel:, mailto:, intent:, market:) belong to the system, not to the in-app browser. */
+    private fun openExternal(url: String): Boolean {
+        return try {
+            val intent = if (url.startsWith("intent:")) Intent.parseUri(url, Intent.URI_INTENT_SCHEME)
+            else Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url))
+            intent.addCategory(Intent.CATEGORY_BROWSABLE)
+            intent.selector = null
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            appContext.startActivity(intent)
+            true
+        } catch (_: Throwable) { false }
+    }
+
     private fun emitState() = emit(stateMap())
 
     private fun emit(event: Map<String, Any?>) {
@@ -279,6 +324,7 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
         emit(selectionMap(IptvStorage.selection(appContext)))
         emit(ParkedVideoPolicy.toMap())
         emit(settingsMap())
+        emit(carBrowserMap(CarBrowserBridge.state))
     }
     override fun onCancel(arguments: Any?) { sink = null }
 
@@ -364,6 +410,29 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
                 result.success(null)
             }
             "connection" -> result.success(connectionMap())
+            "sendBrowserUrl" -> {
+                val r = CarBrowserBridge.send(call.argument<String>("url"), carConnected())
+                // "sent" is only reported once the car confirms it is showing the page.
+                if (r == CarBrowserBridge.SENT) CarBrowserBridge.awaitConfirm(6_000) { result.success(it) }
+                else result.success(r)
+            }
+            "carBrowser" -> result.success(carBrowserMap(CarBrowserBridge.state))
+            "browserHistory" -> result.success(historyList())
+            "recordBrowserHistory" -> {
+                BrowserHistory.record(appContext, call.argument<String>("url") ?: "", call.argument<String>("title") ?: "")
+                result.success(null)
+            }
+            "removeBrowserHistory" -> { BrowserHistory.remove(appContext, call.argument<String>("url") ?: ""); result.success(null) }
+            "clearBrowserHistory" -> { BrowserHistory.clear(appContext); result.success(null) }
+            "importBrowserHistory" -> {
+                val items = (call.argument<List<Map<String, Any?>>>("items") ?: emptyList()).mapNotNull {
+                    val u = it["u"] as? String ?: return@mapNotNull null
+                    BrowserHistory.Entry(u, it["t"] as? String ?: "", (it["at"] as? Number)?.toLong() ?: 0L)
+                }
+                BrowserHistory.import(appContext, items)
+                result.success(null)
+            }
+            "openExternal" -> result.success(openExternal(call.argument<String>("url") ?: ""))
             "selection" -> result.success(selectionMap(IptvStorage.selection(appContext)))
             "setSelection" -> {
                 val scope = call.argument<String>("scope")!!

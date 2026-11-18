@@ -207,6 +207,52 @@ class NativeChannel {
       {'id': id, 'name': name, 'url': url, 'logo': logo, 'group': group};
 }
 
+/// Result of [IptvNative.sendBrowserUrl].
+enum SendToCarResult {
+  /// The car confirmed it is showing the page.
+  sent,
+
+  /// A car is connected but the car app is not open yet; the URL opens as soon as it is.
+  queued,
+
+  /// Sent, but the car did not show it within a few seconds (car app not in front, no surface).
+  unconfirmed,
+
+  /// Same URL was just sent (or the car already shows it): nothing was done.
+  duplicate,
+
+  /// No car is connected.
+  noCar,
+
+  /// Not an http(s) URL.
+  invalid;
+
+  static SendToCarResult parse(String? v) => switch (v) {
+        'sent' => sent,
+        'queued' => queued,
+        'unconfirmed' => unconfirmed,
+        'duplicate' => duplicate,
+        'invalid' => invalid,
+        _ => noCar,
+      };
+}
+
+/// What the car's browser is showing (reported by the car app).
+class CarBrowserState {
+  const CarBrowserState({this.open = false, this.url = '', this.title = '', this.loading = false});
+  final bool open;
+  final String url;
+  final String title;
+  final bool loading;
+
+  factory CarBrowserState.fromMap(Map<Object?, Object?> m) => CarBrowserState(
+        open: m['open'] as bool? ?? false,
+        url: m['url'] as String? ?? '',
+        title: m['title'] as String? ?? '',
+        loading: m['loading'] as bool? ?? false,
+      );
+}
+
 /// Dart facade over the native engine. Methods are no-ops / return defaults on
 /// platforms without a native implementation.
 class IptvNative {
@@ -335,6 +381,65 @@ class IptvNative {
   Future<({int positionMs, int durationMs})> position() async {
     final m = await _method.invokeMapMethod<String, Object?>('position');
     return (positionMs: (m?['positionMs'] as num?)?.toInt() ?? 0, durationMs: (m?['durationMs'] as num?)?.toInt() ?? -1);
+  }
+
+  /// Phone -> car: opens [url] in the car's browser. See [SendToCarResult].
+  Future<SendToCarResult> sendBrowserUrl(String url) async {
+    try {
+      return SendToCarResult.parse(await _method.invokeMethod<String>('sendBrowserUrl', {'url': url}));
+    } on MissingPluginException {
+      return SendToCarResult.noCar;
+    }
+  }
+
+  /// Car -> phone: the car browser's current page (also emitted when it changes).
+  Stream<CarBrowserState> get carBrowser =>
+      _raw.where((e) => e['type'] == 'carBrowser').map(CarBrowserState.fromMap);
+
+  Future<CarBrowserState> currentCarBrowser() async {
+    try {
+      final m = await _method.invokeMethod<Map<Object?, Object?>>('carBrowser');
+      return m == null ? const CarBrowserState() : CarBrowserState.fromMap(m);
+    } on MissingPluginException {
+      return const CarBrowserState();
+    }
+  }
+
+  /// Browser history shared by phone and car (newest first). Each map: u (url), t (title), at (ms).
+  Future<List<Map<String, Object?>>> browserHistory() async {
+    try {
+      final l = await _method.invokeMethod<List<Object?>>('browserHistory');
+      return [for (final e in l ?? const []) Map<String, Object?>.from(e as Map)];
+    } on MissingPluginException {
+      return const [];
+    }
+  }
+
+  /// Fires when the history changed on either side (phone or car).
+  Stream<void> get browserHistoryChanged => _raw.where((e) => e['type'] == 'browserHistory').map((_) {});
+
+  Future<void> recordBrowserHistory(String url, String title) =>
+      _historyCall('recordBrowserHistory', {'url': url, 'title': title});
+  Future<void> removeBrowserHistory(String url) => _historyCall('removeBrowserHistory', {'url': url});
+  Future<void> clearBrowserHistory() => _historyCall('clearBrowserHistory', null);
+  Future<void> importBrowserHistory(List<Map<String, Object?>> items) =>
+      _historyCall('importBrowserHistory', {'items': items});
+
+  Future<void> _historyCall(String m, Object? args) async {
+    try {
+      await _method.invokeMethod<void>(m, args);
+    } on MissingPluginException {
+      // no native side on this platform
+    }
+  }
+
+  /// Opens a non-web link (tel:, mailto:, intent:, market:, ...) with the system. False if nothing handles it.
+  Future<bool> openExternal(String url) async {
+    try {
+      return await _method.invokeMethod<bool>('openExternal', {'url': url}) ?? false;
+    } on MissingPluginException {
+      return false;
+    }
   }
 
   Future<void> resume() => _method.invokeMethod('resume');

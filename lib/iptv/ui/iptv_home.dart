@@ -7,7 +7,6 @@ import '../core/channel.dart';
 import '../iptv_repository.dart';
 import '../widgets/channel_tile.dart';
 import '../widgets/filter_sheet.dart';
-import 'local_videos_screen.dart';
 import 'settings_screen.dart';
 
 enum _View { all, favorites, recents, group }
@@ -298,11 +297,6 @@ List<Widget> iptvAppBarActions(BuildContext context, IPTVRepository repo) {
         for (var i = 0; i < s.playlists.length; i++)
           CheckedPopupMenuItem<int>(value: i, checked: i == s.activeIndex, child: Text(s.playlists[i].name)),
       ],
-    ),
-    IconButton(
-      tooltip: 'Local videos',
-      icon: const Icon(Icons.video_library),
-      onPressed: () => LocalVideosScreen.open(context, repo),
     ),
     IconButton(
       tooltip: 'Reload playlist',

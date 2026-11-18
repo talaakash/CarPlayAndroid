@@ -9,11 +9,17 @@ import 'player_screen.dart';
 /// IPTV uses (queue = the whole library, so Next / Previous step through the files), and the
 /// player screen offers the same Mobile / Android Auto output selector.
 class LocalVideosScreen extends StatelessWidget {
-  const LocalVideosScreen({super.key, required this.repo});
+  const LocalVideosScreen({super.key, required this.repo, this.embedded = false});
   final IPTVRepository repo;
+
+  /// true = just the list, for the Local Video tab (the home shell provides app bar and mini-player).
+  final bool embedded;
 
   static Future<void> open(BuildContext context, IPTVRepository repo) =>
       Navigator.of(context).push(MaterialPageRoute<void>(builder: (_) => LocalVideosScreen(repo: repo)));
+
+  /// System file picker; also used by the Local Video tab's app bar.
+  static Future<void> addVideos(BuildContext context, IPTVRepository repo) => LocalVideosScreen(repo: repo)._add(context);
 
   Future<void> _add(BuildContext context) async {
     final messenger = ScaffoldMessenger.of(context);
@@ -33,13 +39,20 @@ class LocalVideosScreen extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    if (embedded) return _body();
     return Scaffold(
       appBar: AppBar(
         title: const Text('Local videos'),
         actions: [IconButton(tooltip: 'Add videos', icon: const Icon(Icons.add), onPressed: () => _add(context))],
       ),
       bottomNavigationBar: MiniPlayer(repo: repo),
-      body: ListenableBuilder(
+      body: _body(),
+    );
+  }
+
+  Widget _body() {
+    return Builder(builder: (context) {
+      return ListenableBuilder(
         listenable: Listenable.merge([repo.local, repo.playback]),
         builder: (context, _) {
           final videos = repo.local.videos;
@@ -51,8 +64,8 @@ class LocalVideosScreen extends StatelessWidget {
             itemBuilder: (_, i) => _tile(context, videos[i], videos[i].id == currentId),
           );
         },
-      ),
-    );
+      );
+    });
   }
 
   Widget _empty(BuildContext context) {

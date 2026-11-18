@@ -74,6 +74,13 @@ class CarVideoRenderer(private val target: Surface) {
     private var overlayTex = 0
     private var hasOverlay = false
 
+    // Web mode: a second SurfaceTexture fed by the car browser's VirtualDisplay (see CarWebBrowser).
+    private var webTexId = 0
+    private var webTexture: SurfaceTexture? = null
+    private var hasWebFrame = false
+    private var showingWeb = false
+    private val webMatrix = FloatArray(16)
+
     private val texMatrix = FloatArray(16)
     private val mvp = FloatArray(16)
 
@@ -83,6 +90,9 @@ class CarVideoRenderer(private val target: Surface) {
 
     /** Stable Surface the player renders into. Null if GL could not be initialised. */
     @Volatile var inputSurface: Surface? = null; private set
+
+    /** Surface the car browser's VirtualDisplay renders into (shown while [showWeb] is active). */
+    @Volatile var webSurface: Surface? = null; private set
 
     private val quad = ByteBuffer.allocateDirect(8 * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply {
         put(floatArrayOf(-1f, -1f, 1f, -1f, -1f, 1f, 1f, 1f)); position(0)
@@ -98,9 +108,9 @@ class CarVideoRenderer(private val target: Surface) {
     init {
         val ready = CountDownLatch(1)
         handler.post {
-            try { setup() } catch (_: Throwable) { teardown() } finally { ready.countDown() }
+            try { setup() } catch (t: Throwable) { android.util.Log.w("CarBrowser", "renderer setup failed", t); teardown() } finally { ready.countDown() }
         }
-        ready.await(2, TimeUnit.SECONDS)
+        if (!ready.await(2, TimeUnit.SECONDS)) android.util.Log.w("CarBrowser", "renderer setup timed out")
     }
 
     private fun setup() {
@@ -164,6 +174,18 @@ class CarVideoRenderer(private val target: Surface) {
         st.setOnFrameAvailableListener({ draw(newFrame = true) }, handler)
         texture = st
         inputSurface = Surface(st)
+        val wt = IntArray(1)
+        GLES20.glGenTextures(1, wt, 0)
+        webTexId = wt[0]
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, webTexId)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_CLAMP_TO_EDGE)
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_CLAMP_TO_EDGE)
+        val wst = SurfaceTexture(webTexId)
+        wst.setOnFrameAvailableListener({ draw(newFrame = false, newWeb = true) }, handler)
+        webTexture = wst
+        webSurface = Surface(wst)
         val dim = IntArray(1)
         EGL14.eglQuerySurface(display, eglSurface, EGL14.EGL_WIDTH, dim, 0); width = dim[0]
         EGL14.eglQuerySurface(display, eglSurface, EGL14.EGL_HEIGHT, dim, 0); height = dim[0]
@@ -189,7 +211,21 @@ class CarVideoRenderer(private val target: Surface) {
 
     /** Show the player's video (the caller points the player at [inputSurface]). */
     fun showVideo() {
-        handler.post { showingVideo = true; draw(newFrame = false) }
+        handler.post { showingVideo = true; showingWeb = false; draw(newFrame = false) }
+    }
+
+    /** Show the car browser's page; [width] x [height] is the size of its VirtualDisplay. */
+    fun showWeb(width: Int, height: Int) {
+        handler.post {
+            webTexture?.setDefaultBufferSize(width, height)
+            showingWeb = true; showingVideo = false
+            draw(newFrame = false)
+        }
+    }
+
+    /** Size for the next web frames; call before creating the VirtualDisplay. */
+    fun setWebBufferSize(width: Int, height: Int) {
+        webTexture?.setDefaultBufferSize(width, height)
     }
 
     /** Show a full-surface picture (artwork) instead of the video. Takes ownership of [bmp]. */
@@ -202,6 +238,7 @@ class CarVideoRenderer(private val target: Surface) {
                 hasImage = true
             } catch (_: Throwable) {} finally { bmp.recycle() }
             showingVideo = false
+            showingWeb = false
             draw(newFrame = false)
         }
     }
@@ -265,13 +302,18 @@ class CarVideoRenderer(private val target: Surface) {
         handler.post { draw(newFrame = false) }
     }
 
-    private fun draw(newFrame: Boolean) {
+    private fun draw(newFrame: Boolean, newWeb: Boolean = false) {
         if (released || texture == null || eglSurface == EGL14.EGL_NO_SURFACE) return
         try {
             if (newFrame) {
                 texture!!.updateTexImage()
                 texture!!.getTransformMatrix(texMatrix)
                 hasFrame = true
+            }
+            if (newWeb) {
+                webTexture!!.updateTexImage()
+                webTexture!!.getTransformMatrix(webMatrix)
+                hasWebFrame = true
             }
             val w = IntArray(1); val h = IntArray(1)
             EGL14.eglQuerySurface(display, eglSurface, EGL14.EGL_WIDTH, w, 0)
@@ -291,25 +333,16 @@ class CarVideoRenderer(private val target: Surface) {
             GLES20.glViewport(vx, vy, vw, vh)
             GLES20.glEnable(GLES20.GL_SCISSOR_TEST)
             GLES20.glScissor(vx, vy, vw, vh)
-            if (!showingVideo) {
+            if (showingWeb) {
+                if (hasWebFrame) drawOes(webTexId, webMatrix, 1f, 1f)
+            } else if (!showingVideo) {
                 if (hasImage) drawImage(imgTex)
             } else if (hasFrame) {
                 val sa = vw.toFloat() / vh
                 val va = if (videoWidth > 0 && videoHeight > 0) videoWidth / videoHeight else sa
                 // Fit: shrink the quad so the whole picture is inside. Fill: grow it to cover.
                 val (sx, sy) = quadScale(va, sa, fill)
-                android.opengl.Matrix.setIdentityM(mvp, 0)
-                android.opengl.Matrix.scaleM(mvp, 0, sx, sy, 1f)
-                GLES20.glUseProgram(program)
-                GLES20.glUniformMatrix4fv(uMvp, 1, false, mvp, 0)
-                GLES20.glUniformMatrix4fv(uTex, 1, false, texMatrix, 0)
-                GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-                GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, texId)
-                val aPos = GLES20.glGetAttribLocation(program, "aPos")
-                val aUv = GLES20.glGetAttribLocation(program, "aUv")
-                GLES20.glEnableVertexAttribArray(aPos); GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 0, quad)
-                GLES20.glEnableVertexAttribArray(aUv); GLES20.glVertexAttribPointer(aUv, 2, GLES20.GL_FLOAT, false, 0, uv)
-                GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
+                drawOes(texId, texMatrix, sx, sy)
             }
             if (hasOverlay) {
                 GLES20.glEnable(GLES20.GL_BLEND)
@@ -319,6 +352,21 @@ class CarVideoRenderer(private val target: Surface) {
             }
             EGL14.eglSwapBuffers(display, eglSurface)
         } catch (_: Throwable) { /* surface gone: the session will release us */ }
+    }
+
+    private fun drawOes(tex: Int, matrix: FloatArray, sx: Float, sy: Float) {
+        android.opengl.Matrix.setIdentityM(mvp, 0)
+        android.opengl.Matrix.scaleM(mvp, 0, sx, sy, 1f)
+        GLES20.glUseProgram(program)
+        GLES20.glUniformMatrix4fv(uMvp, 1, false, mvp, 0)
+        GLES20.glUniformMatrix4fv(uTex, 1, false, matrix, 0)
+        GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, tex)
+        val aPos = GLES20.glGetAttribLocation(program, "aPos")
+        val aUv = GLES20.glGetAttribLocation(program, "aUv")
+        GLES20.glEnableVertexAttribArray(aPos); GLES20.glVertexAttribPointer(aPos, 2, GLES20.GL_FLOAT, false, 0, quad)
+        GLES20.glEnableVertexAttribArray(aUv); GLES20.glVertexAttribPointer(aUv, 2, GLES20.GL_FLOAT, false, 0, uv)
+        GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4)
     }
 
     private fun drawImage(tex: Int) {
@@ -344,7 +392,9 @@ class CarVideoRenderer(private val target: Surface) {
         released = true
         try { inputSurface?.release() } catch (_: Throwable) {}
         try { texture?.release() } catch (_: Throwable) {}
-        inputSurface = null; texture = null
+        try { webSurface?.release() } catch (_: Throwable) {}
+        try { webTexture?.release() } catch (_: Throwable) {}
+        inputSurface = null; texture = null; webSurface = null; webTexture = null
         if (display != EGL14.EGL_NO_DISPLAY) {
             EGL14.eglMakeCurrent(display, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT)
             if (eglSurface != EGL14.EGL_NO_SURFACE) EGL14.eglDestroySurface(display, eglSurface)
