@@ -416,6 +416,7 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
                 if (r == CarBrowserBridge.SENT) CarBrowserBridge.awaitConfirm(6_000) { result.success(it) }
                 else result.success(r)
             }
+            "syncBrowserUrl" -> result.success(CarBrowserBridge.sync(call.argument<String>("url"), carConnected()))
             "carBrowser" -> result.success(carBrowserMap(CarBrowserBridge.state))
             "browserHistory" -> result.success(historyList())
             "recordBrowserHistory" -> {

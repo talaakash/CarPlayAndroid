@@ -46,10 +46,8 @@ class BrowserController extends ChangeNotifier {
         },
         onWebResourceError: _onError,
       ));
-    _carSub = _native.carBrowser.listen((s) {
-      carState = s;
-      notifyListeners();
-    }, onError: (Object _) {});
+    _carSub = _native.carBrowser.listen(_onCarState, onError: (Object _) {});
+    _loadMirrorPref();
     _historySub = _native.browserHistoryChanged.listen((_) => _refreshHistory(), onError: (Object _) {});
     _native.currentCarBrowser().then((s) {
       carState = s;
@@ -80,8 +78,9 @@ class BrowserController extends ChangeNotifier {
 
   CarBrowserState carState = const CarBrowserState();
 
-  /// Keep the car on the same page whenever the phone navigates.
-  bool mirrorToCar = false;
+  /// Keep phone and car on the same page (both directions). On by default, remembered across launches.
+  bool mirrorToCar = true;
+  static const _mirrorKey = 'browser.mirror';
   bool _sending = false;
   bool get sending => _sending;
 
@@ -151,6 +150,7 @@ class BrowserController extends ChangeNotifier {
     if (url.isEmpty) return;
     inPage = true;
     notifyListeners();
+    _scheduleMirror();
   }
 
   /// System back inside the Browser tab. Returns true if it was consumed.
@@ -293,17 +293,50 @@ class BrowserController extends ChangeNotifier {
   void setMirror(bool on) {
     mirrorToCar = on;
     notifyListeners();
-    if (on) _scheduleMirror();
+    SharedPreferences.getInstance().then((p) => p.setBool(_mirrorKey, on)).catchError((Object _) => false);
+    if (on) {
+      _lastMirrored = '';
+      _scheduleMirror();
+    }
+  }
+
+  Future<void> _loadMirrorPref() async {
+    try {
+      final v = (await SharedPreferences.getInstance()).getBool(_mirrorKey);
+      if (v != null && v != mirrorToCar) {
+        mirrorToCar = v;
+        notifyListeners();
+      }
+    } catch (_) {}
+  }
+
+  /// Car -> phone. The car's browser is the same session: when the user navigates there, follow it
+  /// here (unless the page is already the same, which also stops echo loops), and when a car session
+  /// (re)connects with nothing open, push the phone's page again.
+  void _onCarState(CarBrowserState s) {
+    carState = s;
+    notifyListeners();
+    if (!mirrorToCar) return;
+    if (s.url.isEmpty && !s.open) {
+      _lastMirrored = ''; // new car session
+      _scheduleMirror();
+      return;
+    }
+    if (s.open && !s.loading && BrowserInput.isWebUrl(s.url) && !sameBrowserPage(s.url, url) && !sameBrowserPage(s.url, _lastMirrored)) {
+      _lastMirrored = s.url; // already on the car: do not send it back
+      open(s.url);
+    }
   }
 
   String _lastMirrored = '';
   void _scheduleMirror() {
-    if (!mirrorToCar || !inPage || !BrowserInput.isWebUrl(url) || url == _lastMirrored) return;
+    if (!mirrorToCar || !inPage || !BrowserInput.isWebUrl(url) || sameBrowserPage(url, _lastMirrored)) return;
     _mirrorTimer?.cancel();
     _mirrorTimer = Timer(const Duration(milliseconds: 800), () async {
       final u = url;
-      if (u == _lastMirrored || !BrowserInput.isWebUrl(u)) return;
-      final r = await _native.sendBrowserUrl(u);
+      if (sameBrowserPage(u, _lastMirrored) || !BrowserInput.isWebUrl(u)) return;
+      // Background sync: the car browser follows without taking over the car screen (video keeps playing).
+      final r = await _native.syncBrowserUrl(u);
       if (r == SendToCarResult.sent || r == SendToCarResult.queued || r == SendToCarResult.duplicate) _lastMirrored = u;
     });
   }

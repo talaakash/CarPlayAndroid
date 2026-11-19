@@ -16,7 +16,12 @@ import android.os.SystemClock
  */
 object CarBrowserBridge {
     /** Implemented by the car session. */
-    interface CarSide { fun openUrl(url: String) }
+    interface CarSide {
+        /** Show [url] and bring the browser screen to the front (explicit "Send to Car"). */
+        fun openUrl(url: String)
+        /** Make [url] the car browser's page without leaving the current car screen (background sync). */
+        fun syncUrl(url: String)
+    }
 
     data class State(val open: Boolean = false, val url: String = "", val title: String = "", val loading: Boolean = false)
 
@@ -53,13 +58,34 @@ object CarBrowserBridge {
         return if (s != null) { pending = null; s.openUrl(url); SENT } else { pending = url to now; QUEUED }
     }
 
-    /** The car session started: deliver a URL that was waiting for it. */
+    /**
+     * Phone -> car, background sync: the car's browser follows the phone's page but the car screen is not
+     * touched (no interruption of video). The URL is remembered in [lastPage] so a car session that
+     * connects (or reconnects) later starts on the same page.
+     */
+    fun sync(rawUrl: String?, carConnected: Boolean): String {
+        val url = WebUrls.normalize(rawUrl) ?: return INVALID
+        lastPage = url
+        val s = side ?: return if (carConnected) QUEUED else NO_CAR
+        if (WebUrls.same(state.url, url)) return DUPLICATE
+        s.syncUrl(url)
+        return SENT
+    }
+
+    /** The page the browser was last on (phone or car); survives a car session ending. */
+    @Volatile var lastPage: String? = null; private set
+
+    /** The car session started: deliver a URL that was waiting for it, or restore the last page. */
     fun attach(car: CarSide) {
         side = car
         val p = pending
         pending = null
+        val last = lastPage
         if (p != null && SystemClock.elapsedRealtime() - p.second < PENDING_TTL_MS) car.openUrl(p.first)
-        else publish(State()) // fresh session: nothing open yet
+        else {
+            publish(State()) // fresh session: nothing open yet
+            if (last != null) car.syncUrl(last)
+        }
     }
 
     fun detach(car: CarSide) {
@@ -92,6 +118,7 @@ object CarBrowserBridge {
     fun publish(s: State) {
         if (s == state) return
         state = s
+        if (s.url.isNotEmpty()) lastPage = s.url
         onState?.invoke(s)
         if (s.open) finishWait(SENT)
     }
@@ -133,17 +160,17 @@ object WebUrls {
 
 /** Popular sites on the car's Browser tab. Keep in sync with `lib/browser/browser_sites.dart`. */
 object PopularSites {
-    data class Site(val name: String, val url: String, val domain: String)
+    data class Site(val name: String, val url: String, val domain: String, val color: Int = 0xFF37474F.toInt())
 
     val all = listOf(
-        Site("Google", "https://www.google.com", "google.com"),
-        Site("YouTube", "https://m.youtube.com", "youtube.com"),
-        Site("Facebook", "https://m.facebook.com", "facebook.com"),
-        Site("Instagram", "https://www.instagram.com", "instagram.com"),
-        Site("X", "https://x.com", "x.com"),
-        Site("Wikipedia", "https://en.m.wikipedia.org", "wikipedia.org"),
-        Site("Reddit", "https://www.reddit.com", "reddit.com"),
-        Site("Amazon", "https://www.amazon.com", "amazon.com"),
+        Site("Google", "https://www.google.com", "google.com", 0xFF4285F4.toInt()),
+        Site("YouTube", "https://m.youtube.com", "youtube.com", 0xFFFF0000.toInt()),
+        Site("Facebook", "https://m.facebook.com", "facebook.com", 0xFF1877F2.toInt()),
+        Site("Instagram", "https://www.instagram.com", "instagram.com", 0xFFE4405F.toInt()),
+        Site("X", "https://x.com", "x.com", 0xFF111111.toInt()),
+        Site("Wikipedia", "https://en.m.wikipedia.org", "wikipedia.org", 0xFF636466.toInt()),
+        Site("Reddit", "https://www.reddit.com", "reddit.com", 0xFFFF4500.toInt()),
+        Site("Amazon", "https://www.amazon.com", "amazon.com", 0xFFFF9900.toInt()),
     )
 
     fun favicon(domain: String) = "https://www.google.com/s2/favicons?domain=$domain&sz=128"

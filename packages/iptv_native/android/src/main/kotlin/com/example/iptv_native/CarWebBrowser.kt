@@ -168,10 +168,18 @@ internal class CarWebBrowser(private val ctx: Context, private val onChange: () 
     // ---- commands ----------------------------------------------------------------------------
 
     fun load(target: String) {
-        this@CarWebBrowser.url = target; this@CarWebBrowser.title = ""; this@CarWebBrowser.error = null; this@CarWebBrowser.loading = true; this@CarWebBrowser.progress = 0
-        BrowserHistory.record(ctx, target, "") // visible on the phone immediately
+        // Already on this page (live, or saved for the next attach): do not reload it.
+        if (error == null && WebUrls.same(url, target) && (web != null || saved != null) && pendingUrl == null) return
+        this@CarWebBrowser.url = target; this@CarWebBrowser.title = ""; this@CarWebBrowser.error = null
         val wv = web
-        if (wv == null) pendingUrl = target else wv.loadUrl(target)
+        if (wv == null) {
+            pendingUrl = target; saved = null
+            onChange()
+            return // loads when the browser screen attaches; nothing is loading yet
+        }
+        this@CarWebBrowser.loading = true; this@CarWebBrowser.progress = 0
+        BrowserHistory.record(ctx, target, "") // visible on the phone immediately
+        wv.loadUrl(target)
         onChange()
     }
 

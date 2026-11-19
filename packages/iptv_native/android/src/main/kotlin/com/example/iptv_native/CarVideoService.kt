@@ -48,6 +48,7 @@ import androidx.lifecycle.DefaultLifecycleObserver
 import androidx.lifecycle.LifecycleOwner
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
 import androidx.media3.common.Player
 import androidx.media3.session.LibraryResult
 import androidx.media3.session.MediaBrowser
@@ -112,6 +113,22 @@ private class CarVideoSession : Session() {
     private val browserUi by lazy { CarBrowserUi(carContext) }
     /** The web screen is the top screen (its NavigationTemplate surface is the page). */
     private var webActive = false
+    /** The browser home (search, popular sites, history) is shown instead of the page, like the phone's Browser tab. */
+    private var webHome = false
+    private var homeScroll = 0f
+    private var iconsLoaded = 0
+    /** Which of the phone's three tabs the car shell shows (CarShellUi.NAV_*). */
+    private var shellTab = CarShellUi.NAV_IPTV
+    private var shellOk = false
+    private var shellVersion = 0
+    private var iptvSearch = ""
+    private var chipScroll = 0f
+    private val listScroll = floatArrayOf(0f, 0f)
+    private var shellCacheKey = ""
+    private var shellCache: List<IptvStorage.Channel> = emptyList()
+    private val shellUi by lazy { CarShellUi(carContext) }
+    private val localMeta by lazy { LocalVideoMeta(carContext) { uiHandler.post { metaTick++; overlayKey = ""; if (webActive) updateOverlay() } } }
+    private val homeUi by lazy { CarBrowserHomeUi(carContext) }
     private var webAttachTried = false
     private var tabs: TabsScreen? = null
     private val tabsSupported get() = carContext.carAppApiLevel >= 6
@@ -119,6 +136,7 @@ private class CarVideoSession : Session() {
     /** Phone -> car: [CarBrowserBridge.send] ends up here. */
     private val carSide = object : CarBrowserBridge.CarSide {
         override fun openUrl(url: String) { uiHandler.post { loadInCar(url) } }
+        override fun syncUrl(url: String) { uiHandler.post { webBrowser.load(url) } } // no screen change, no reload if already there
     }
 
     private val speedListener = OnCarDataAvailableListener<Speed> { speed ->
@@ -145,9 +163,27 @@ private class CarVideoSession : Session() {
 
         override fun onClick(x: Float, y: Float) = onUiClick(x, y)
 
-        override fun onScroll(distanceX: Float, distanceY: Float) { if (webActive) webBrowser.scroll(distanceX, distanceY) }
+        override fun onScroll(distanceX: Float, distanceY: Float) {
+            if (!webActive) return
+            if (shellTab != CarShellUi.NAV_BROWSER) {
+                if (shellTab == CarShellUi.NAV_IPTV && Math.abs(distanceX) > Math.abs(distanceY) * 1.2f) {
+                    chipScroll = (chipScroll + distanceX).coerceIn(0f, shellUi.maxChipScroll)
+                } else {
+                    stopFling()
+                    listScroll[shellTab] = (listScroll[shellTab] + distanceY).coerceIn(0f, shellUi.maxScroll)
+                }
+                updateOverlay()
+            } else if (webHome) {
+                homeScroll = (homeScroll + distanceY).coerceIn(0f, homeUi.maxScroll)
+                updateOverlay()
+            } else webBrowser.scroll(distanceX, distanceY)
+        }
 
-        override fun onFling(velocityX: Float, velocityY: Float) { if (webActive) webBrowser.fling(velocityX, velocityY) }
+        override fun onFling(velocityX: Float, velocityY: Float) {
+            if (!webActive) return
+            if (shellTab != CarShellUi.NAV_BROWSER) startFling(-velocityY)
+            else if (!webHome) webBrowser.fling(velocityX, velocityY)
+        }
 
         override fun onSurfaceDestroyed(surfaceContainer: SurfaceContainer) {
             android.util.Log.i(TAG, "surface destroyed")
@@ -215,6 +251,12 @@ private class CarVideoSession : Session() {
     /** Browser on screen: show the page when parked, otherwise a black screen with the driving message. */
     private fun syncWeb(r: CarVideoRenderer) {
         android.util.Log.i(TAG, "syncWeb allowed=${videoAllowed()} attached=${webBrowser.attached} tried=$webAttachTried")
+        if (shellTab != CarShellUi.NAV_BROWSER || webHome) {
+            // IPTV / Local Video / the browser home are drawn screens: no WebView runs (page + history are kept for later).
+            if (webBrowser.attached) { webBrowser.detach(); webAttachTried = false }
+            r.showArtwork(Bitmap.createBitmap(2, 2, Bitmap.Config.ARGB_8888).apply { eraseColor(Color.BLACK) })
+            return
+        }
         if (videoAllowed()) {
             if (!webBrowser.attached && !webAttachTried) {
                 webAttachTried = true
@@ -236,7 +278,7 @@ private class CarVideoSession : Session() {
     private fun loadInCar(url: String) {
         android.util.Log.i(TAG, "loadInCar (screens=${carContext.getCarService(androidx.car.app.ScreenManager::class.java).screenStack.size}, renderer=${renderer != null})")
         webBrowser.load(url)
-        openWeb()
+        openWeb(home = false)
         if (renderer == null) bringToFront()
     }
 
@@ -252,7 +294,9 @@ private class CarVideoSession : Session() {
         }
     }
 
-    private fun openWeb() {
+    private fun openWeb(home: Boolean = false) {
+        if (shellTab != CarShellUi.NAV_BROWSER) { shellTab = CarShellUi.NAV_BROWSER; overlayKey = ""; sync() }
+        if (webHome != home) { webHome = home; homeScroll = 0f; overlayKey = ""; sync() }
         val sm = carContext.getCarService(androidx.car.app.ScreenManager::class.java)
         if (sm.screenStack.any { it.marker == WEB_MARKER }) sm.popTo(WEB_MARKER)
         else sm.push(WebScreen(carContext).also { it.marker = WEB_MARKER })
@@ -335,6 +379,7 @@ private class CarVideoSession : Session() {
     }
 
     private fun updateWebOverlay(r: CarVideoRenderer) {
+        if (shellTab != CarShellUi.NAV_BROWSER) { updateShellOverlay(r); return }
         val banner: Pair<String, String>? = when {
             !videoAllowed() -> if (moving == true) "Browser paused while driving" to "Available again when the car is parked"
                 else "Browser unavailable" to "Vehicle speed is not available"
@@ -342,6 +387,7 @@ private class CarVideoSession : Session() {
             webBrowser.error != null -> "Can't open this page" to webBrowser.error!!
             else -> null
         }
+        if (webHome && videoAllowed()) { updateHomeOverlay(r); return }
         val st = CarBrowserUi.State(webBrowser.title, webBrowser.url, webBrowser.loading, webBrowser.progress,
             webBrowser.canBack, webBrowser.canForward, banner)
         val (aw, ah) = r.areaSize()
@@ -351,13 +397,249 @@ private class CarVideoSession : Session() {
         r.setOverlay(browserUi.render(aw, ah, st))
     }
 
+    private fun updateHomeOverlay(r: CarVideoRenderer) {
+        val prefs = try { carContext.getSharedPreferences("FlutterSharedPreferences", android.content.Context.MODE_PRIVATE) } catch (_: Throwable) { null }
+        val reload = { uiHandler.post { iconsLoaded++; overlayKey = ""; if (webActive && webHome) updateOverlay() }; Unit }
+        val sites = PopularSites.all.map { site ->
+            val url = PopularSites.favicon(site.domain)
+            artwork.thumb(site.name, url, onLoaded = reload) // starts the download once
+            CarBrowserHomeUi.SiteTile(site, artwork.cachedThumb(url))
+        }
+        val cur = if (webBrowser.hasPage) CarBrowserHomeUi.Row(webBrowser.title, webBrowser.url) else null
+        val history = BrowserHistory.list(carContext).filterNot { cur != null && WebUrls.same(it.url, cur.url) }
+            .take(6).map { CarBrowserHomeUi.Row(it.title, it.url) }
+        val st = CarBrowserHomeUi.State(sites, history, cur, prefs?.getBoolean("flutter.iptv.dark", false) ?: false,
+            prefs?.getString("flutter.iptv.accent", null), iconsLoaded)
+        val (aw, ah) = r.areaSize()
+        val frame = shellFrame()
+        val key = "home|$st|$aw|$ah|$homeScroll|${frame.palette.surface}"
+        if (key == overlayKey) return
+        overlayKey = key
+        val inset = CarShellUi.navHeight(ah)
+        val bmp = homeUi.render(aw, ah, homeScroll, st, inset)
+        if (bmp != null) shellUi.drawChrome(Canvas(bmp), aw, ah, shellFrame(), withMini = false)
+        r.setOverlay(bmp)
+        homeScroll = homeScroll.coerceIn(0f, homeUi.maxScroll)
+    }
+
+    // ---- Phone-style IPTV / Local Video screens (drawn on the Surface) ----------------------------
+
+    private fun prefs() = try { carContext.getSharedPreferences("FlutterSharedPreferences", android.content.Context.MODE_PRIVATE) } catch (_: Throwable) { null }
+
+    private fun shellFrame(mini: Boolean = false): CarShellUi.Frame {
+        val pr = prefs()
+        val pal = CarPalette.of(pr?.getBoolean("flutter.iptv.dark", false) ?: false, pr?.getString("flutter.iptv.accent", null))
+        val b = browser
+        val md = b?.currentMediaItem?.mediaMetadata
+        val miniState = if (b != null && b.mediaItemCount > 0 && md != null) {
+            val local = currentIsLocal()
+            val status = when {
+                b.playerError != null -> "Playback error"
+                b.playbackState == Player.STATE_BUFFERING -> "Buffering…"
+                b.playWhenReady -> if (local) "Playing local video" else "Live"
+                else -> "Paused"
+            }
+            val url = md.artworkUri?.toString()
+            val logo = if (url != null && url.startsWith("http")) { artwork.thumb(md.title?.toString() ?: "", url, onLoaded = { iconReloaded() }); artwork.cachedThumb(url) } else null
+            CarShellUi.Mini(md.title?.toString().orEmpty(), status, logo, b.playWhenReady)
+        } else null
+        val chs = IptvStorage.channels(carContext).size
+        val status = if (shellTab == CarShellUi.NAV_LOCAL) "Local videos"
+            else (IptvStorage.playlists(carContext).firstOrNull { it.active }?.name ?: "Playlist") + " · $chs channels"
+        return CarShellUi.Frame(pal, "Car Play", status,
+            if (shellTab == CarShellUi.NAV_LOCAL) R.drawable.ic_car_video else R.drawable.ic_car_tv, shellTab, if (mini) miniState else miniState)
+    }
+
+    private fun iconReloaded() { uiHandler.post { iconsLoaded++; overlayKey = ""; if (webActive && shellTab != CarShellUi.NAV_BROWSER) updateOverlay() } }
+
+    /** The phone's current list: all | favorites | recents | cat:<group> (shared selection, so both sides follow each other). */
+    private fun shellScope(): String {
+        val sc = IptvStorage.selection(carContext).scope
+        return if (sc == "favorites" || sc == "recents" || sc.startsWith("cat:")) sc else "all"
+    }
+
+    private fun shellChannels(scope: String): List<IptvStorage.Channel> {
+        val key = "$scope|$iptvSearch|$shellVersion"
+        if (key == shellCacheKey) return shellCache
+        val all = IptvStorage.channels(carContext)
+        var list = when {
+            scope == "favorites" -> IptvStorage.favorites(carContext)
+            scope == "recents" -> IptvStorage.recents(carContext)
+            scope.startsWith("cat:") -> all.filter { it.group == scope.removePrefix("cat:") }
+            else -> all
+        }
+        val q = iptvSearch.trim().lowercase()
+        if (q.isNotEmpty()) list = list.filter { it.name.lowercase().contains(q) }
+        shellCacheKey = key; shellCache = list
+        return list
+    }
+
+    private fun shellChips(scope: String): List<CarShellUi.Chip> {
+        val chips = ArrayList<CarShellUi.Chip>()
+        chips.add(CarShellUi.Chip("All", "all", R.drawable.ic_car_tv, scope == "all"))
+        chips.add(CarShellUi.Chip("Favorites (${IptvStorage.favorites(carContext).size})", "favorites", R.drawable.ic_car_fav, scope == "favorites"))
+        chips.add(CarShellUi.Chip("Recent", "recents", R.drawable.ic_car_history, scope == "recents"))
+        IptvStorage.groups(carContext).forEach { (g, n) -> chips.add(CarShellUi.Chip("$g ($n)", "cat:$g", R.drawable.ic_car_category, scope == "cat:$g")) }
+        return chips
+    }
+
+    private fun updateShellOverlay(r: CarVideoRenderer) {
+        val (aw, ah) = r.areaSize()
+        val frame = shellFrame()
+        val mini = frame.mini
+        val bmp: Bitmap?
+        val key: String
+        val miniKey = mini?.let { "${it.title}|${it.status}|${it.playing}|${it.logo != null}" }
+        if (shellTab == CarShellUi.NAV_LOCAL) {
+            val vids = IptvStorage.localVideos(carContext)
+            val cur = browser?.currentMediaItem?.mediaId?.let(IptvPlaybackService::parseChannelId)
+            val playing = browser?.playWhenReady == true
+            key = "local|$aw|$ah|${vids.size}|$shellVersion|${listScroll[1]}|$cur|$playing|$miniKey|${frame.palette.surface}|${frame.palette.primary}|$iconsLoaded|${localMetaVersion()}"
+            if (key == overlayKey) return
+            overlayKey = key
+            bmp = shellUi.renderLocal(aw, ah, frame, CarShellUi.LocalContent(vids, cur, playing) { localMeta.get(it) }, listScroll[1])
+            listScroll[1] = listScroll[1].coerceIn(0f, shellUi.maxScroll)
+        } else {
+            val scope = shellScope()
+            val list = shellChannels(scope)
+            val cur = browser?.currentMediaItem?.takeIf { !currentIsLocal() }?.mediaId?.let(IptvPlaybackService::parseChannelId)
+            val playing = browser?.playWhenReady == true
+            key = "iptv|$aw|$ah|$scope|$iptvSearch|${list.size}|$shellVersion|${listScroll[0]}|$chipScroll|$cur|$playing|$miniKey|${frame.palette.surface}|${frame.palette.primary}|$iconsLoaded"
+            if (key == overlayKey) return
+            overlayKey = key
+            val favs = IptvStorage.favorites(carContext).map { it.id }.toHashSet()
+            val total = IptvStorage.channels(carContext).size
+            val empty = when {
+                total == 0 -> "No channels yet\nOpen the app on your phone to load your playlist"
+                list.isEmpty() && scope == "favorites" && iptvSearch.isBlank() -> "No favorites yet.\nTap the heart on a channel."
+                list.isEmpty() && scope == "recents" && iptvSearch.isBlank() -> "Nothing watched yet."
+                else -> null
+            }
+            val content = CarShellUi.IptvContent(shellChips(scope), iptvSearch, "Search $total channels…", list, favs, cur, playing, empty,
+                scope == "recents") { ch ->
+                if (ch.logo.startsWith("http")) { artwork.thumb(ch.name, ch.logo, onLoaded = { iconReloaded() }); artwork.cachedThumb(ch.logo) } else null
+            }
+            bmp = shellUi.renderIptv(aw, ah, frame, content, listScroll[0], chipScroll)
+            listScroll[0] = listScroll[0].coerceIn(0f, shellUi.maxScroll)
+            chipScroll = chipScroll.coerceIn(0f, shellUi.maxChipScroll)
+        }
+        r.setOverlay(bmp)
+    }
+
+    private var metaTick = 0
+    private fun localMetaVersion() = metaTick
+
+    private fun playFromShell(scope: String, ch: IptvStorage.Channel) {
+        val b = browser ?: return
+        val item = MediaItem.Builder().setMediaId("${IptvPlaybackService.CH_PREFIX}$scope|${ch.id}")
+            .setMediaMetadata(MediaMetadata.Builder().setTitle(ch.name).setIsPlayable(true).setIsBrowsable(false).build()).build()
+        b.setMediaItem(item)
+        b.prepare()
+        b.play()
+        openPlayer()
+    }
+
+    private fun switchTab(id: Int) {
+        if (id == shellTab && (id != CarShellUi.NAV_BROWSER || webHome)) return
+        stopFling()
+        shellTab = id
+        if (id == CarShellUi.NAV_BROWSER) { webHome = true; homeScroll = 0f }
+        overlayKey = ""
+        sync()
+        onWebChanged()
+    }
+
+    private fun onShellHit(hit: CarShellUi.Hit, x: Float, y: Float) {
+        val b = browser
+        when (hit.kind) {
+            CarShellUi.Kind.NAV -> switchTab(hit.index)
+            CarShellUi.Kind.MINI -> openPlayer()
+            CarShellUi.Kind.MINI_PLAY -> b?.let { if (it.playWhenReady) it.pause() else it.play() }
+            CarShellUi.Kind.MINI_PREV -> b?.seekToPreviousMediaItem()
+            CarShellUi.Kind.MINI_NEXT -> b?.seekToNextMediaItem()
+            CarShellUi.Kind.CHIP -> {
+                val chip = shellChips(shellScope()).getOrNull(hit.index) ?: return
+                val label = when {
+                    chip.scope == "all" -> "All channels"
+                    chip.scope == "favorites" -> "Favorites"
+                    chip.scope == "recents" -> "Recently watched"
+                    else -> chip.scope.removePrefix("cat:")
+                }
+                IptvStorage.setSelection(carContext, chip.scope, label, "car")
+                listScroll[0] = 0f; shellVersion++; overlayKey = ""
+                updateOverlay()
+            }
+            CarShellUi.Kind.SEARCH -> screenManager().push(ChannelSearchScreen(carContext))
+            CarShellUi.Kind.SEARCH_CLEAR -> { iptvSearch = ""; listScroll[0] = 0f; shellVersion++; overlayKey = ""; updateOverlay() }
+            CarShellUi.Kind.CLEAR_RECENTS -> IptvStorage.clearRecents(carContext)
+            CarShellUi.Kind.ROW -> if (shellTab == CarShellUi.NAV_LOCAL) {
+                IptvStorage.localVideos(carContext).getOrNull(hit.index)?.let { playFromShell(IptvPlaybackService.LOCAL_SCOPE, it) }
+            } else {
+                val scope = shellScope()
+                shellChannels(scope).getOrNull(hit.index)?.let {
+                    playFromShell(if (iptvSearch.isNotBlank()) IptvPlaybackService.SEARCH_PREFIX + iptvSearch.trim() else scope, it)
+                }
+            }
+            CarShellUi.Kind.FAV -> shellChannels(shellScope()).getOrNull(hit.index)?.let { IptvStorage.toggleFavorite(carContext, it.id) }
+        }
+    }
+
+    private fun screenManager() = carContext.getCarService(androidx.car.app.ScreenManager::class.java)
+
+    // Momentum scrolling for the drawn lists.
+    private var flingV = 0f
+    private val flingTick = object : Runnable {
+        override fun run() {
+            if (!webActive || shellTab == CarShellUi.NAV_BROWSER || Math.abs(flingV) < 40f) { flingV = 0f; return }
+            val old = listScroll[shellTab]
+            listScroll[shellTab] = (old + flingV * 0.016f).coerceIn(0f, shellUi.maxScroll)
+            if (listScroll[shellTab] == old) { flingV = 0f; updateOverlay(); return }
+            flingV *= 0.94f
+            updateOverlay()
+            uiHandler.postDelayed(this, 16)
+        }
+    }
+    private fun startFling(v: Float) { uiHandler.removeCallbacks(flingTick); flingV = v; uiHandler.post(flingTick) }
+    private fun stopFling() { flingV = 0f; uiHandler.removeCallbacks(flingTick) }
+
+    private fun onHomeClick(x: Float, y: Float) {
+        shellUi.hitTestChrome(x, y)?.let { onShellHit(it, x, y); return }
+        val hit = homeUi.hitTest(x, y) ?: return
+        val cur = if (webBrowser.hasPage) webBrowser.url else null
+        when (hit.kind) {
+            CarBrowserHomeUi.Kind.SEARCH -> openSearch()
+            CarBrowserHomeUi.Kind.CURRENT -> { webHome = false; overlayKey = ""; sync(); onWebChanged() }
+            CarBrowserHomeUi.Kind.SITE -> PopularSites.all.getOrNull(hit.index)?.let { openFromHome(it.url) }
+            CarBrowserHomeUi.Kind.HISTORY -> BrowserHistory.list(carContext)
+                .filterNot { cur != null && WebUrls.same(it.url, cur) }.take(6).getOrNull(hit.index)?.let { openFromHome(it.url) }
+            CarBrowserHomeUi.Kind.CLEAR -> { BrowserHistory.clear(carContext); overlayKey = ""; updateOverlay() }
+        }
+    }
+
+    /** Home: stop the page (loading, scripts, media, network) and show the browser home; the page is kept to resume. */
+    private fun goBrowserHome() {
+        webBrowser.stop()
+        webHome = true; homeScroll = 0f; overlayKey = ""
+        sync() // detaches the WebView (state saved)
+        onWebChanged()
+    }
+
+    private fun openFromHome(url: String) {
+        webHome = false; overlayKey = ""
+        webBrowser.load(url)
+        sync() // attaches the WebView
+        onWebChanged()
+    }
+
     private fun onWebClick(r: CarVideoRenderer, x: Float, y: Float) {
         val a = r.areaRect()
         val lx = x - a.left
         val ly = y - a.top
+        if (shellTab != CarShellUi.NAV_BROWSER) { shellUi.hitTest(lx, ly)?.let { onShellHit(it, lx, ly) }; return }
+        if (webHome && videoAllowed()) { onHomeClick(lx, ly); return }
         if (ly < CarBrowserUi.barHeight(a.height())) {
             when (browserUi.hitTest(lx, ly)) {
-                CarBrowserUi.Hit.HOME -> try { carContext.getCarService(androidx.car.app.ScreenManager::class.java).popToRoot() } catch (_: Throwable) {}
+                CarBrowserUi.Hit.HOME -> goBrowserHome()
                 CarBrowserUi.Hit.BACK -> webBrowser.back()
                 CarBrowserUi.Hit.FORWARD -> webBrowser.forward()
                 CarBrowserUi.Hit.RELOAD -> if (webBrowser.loading) webBrowser.stop() else webBrowser.reload()
@@ -455,6 +737,8 @@ private class CarVideoSession : Session() {
     /** Shared data changed (phone or car): settings re-route video, lists reload in place. */
     private val changeListener: (String) -> Unit = { kind ->
         ContextCompat.getMainExecutor(carContext).execute {
+            shellVersion++
+            overlayKey = ""
             if (kind == "settings") {
                 IptvPlaybackService.setFill(IptvStorage.videoFit(carContext) == IptvStorage.FILL)
                 sync()
@@ -503,6 +787,7 @@ private class CarVideoSession : Session() {
 
         try {
             ctx.getCarService(AppManager::class.java).setSurfaceCallback(surfaceCallback)
+            shellOk = true
         } catch (_: Throwable) { /* ACCESS_SURFACE not granted: no video, browsing still works */ }
 
         try {
@@ -533,7 +818,8 @@ private class CarVideoSession : Session() {
         // Phone -> car: a URL sent before this session existed is delivered right away.
         CarBrowserBridge.attach(carSide)
         // Home screen: IPTV / Local Video / Browser tabs; older hosts fall back to the channel list.
-        return if (tabsSupported) TabsScreen(ctx).also { tabs = it }
+        return if (shellOk) WebScreen(ctx).also { it.marker = WEB_MARKER } // phone-style IPTV / Local Video / Browser, drawn on the Surface
+        else if (tabsSupported) TabsScreen(ctx).also { tabs = it }
         else BrowseScreen(ctx, IptvPlaybackService.HOME, "IPTV", isRoot = true)
     }
 
@@ -792,7 +1078,7 @@ private class CarVideoSession : Session() {
 
     /** Fallback entry for hosts without tabs: the browser's start list as its own screen. */
     private fun openBrowserHome() {
-        carContext.getCarService(androidx.car.app.ScreenManager::class.java).push(BrowserHomeScreen(carContext))
+        openWeb(home = true)
     }
 
     private fun browserRows(onLoaded: () -> Unit): ItemList {
@@ -862,14 +1148,17 @@ private class CarVideoSession : Session() {
             fun tab(id: String, title: String, res: Int) =
                 Tab.Builder().setTitle(title).setIcon(icon(res)).setContentId(id).build()
             val b = TabTemplate.Builder(object : TabTemplate.TabCallback {
-                override fun onTabSelected(tabContentId: String) { active = tabContentId; invalidate() }
+                override fun onTabSelected(tabContentId: String) {
+                    // Browser opens its own full screen (search bar, site grid, history); the tab bar keeps the previous tab.
+                    if (tabContentId == TAB_BROWSER) openWeb(home = true) else { active = tabContentId; invalidate() }
+                }
             })
                 .setHeaderAction(Action.APP_ICON)
                 .addTab(tab(TAB_IPTV, "IPTV", R.drawable.ic_car_tv))
                 .addTab(tab(TAB_LOCAL, "Local Video", R.drawable.ic_car_video))
                 .addTab(tab(TAB_BROWSER, "Browser", R.drawable.ic_car_web))
                 .setTabContents(TabContents.Builder(content).build())
-                .setActiveTabContentId(active)
+                .setActiveTabContentId(if (active == TAB_BROWSER) TAB_IPTV else active)
             return b.build()
         }
     }
@@ -910,13 +1199,48 @@ private class CarVideoSession : Session() {
             .setBackgroundColor(CarColor.createCustom(Color.WHITE, Color.WHITE))
             .setActionStrip(
                 ActionStrip.Builder()
-                    .addAction(Action.Builder().setTitle("Home").setIcon(icon(R.drawable.ic_car_list))
-                        .setOnClickListener { screenManager.popToRoot() }.build())
+                    .addAction(
+                        if (screenManager.screenStack.size > 1) Action.Builder().setTitle("Menu").setIcon(icon(R.drawable.ic_car_list))
+                            .setOnClickListener { screenManager.popToRoot() }.build()
+                        else Action.Builder().setTitle("Player").setIcon(icon(R.drawable.ic_car_nowplaying))
+                            .setOnClickListener { if (browser?.mediaItemCount ?: 0 > 0) openPlayer() }.build())
                     .build()
             )
             // PAN lets the host deliver scroll / fling gestures to the SurfaceCallback.
             .setMapActionStrip(ActionStrip.Builder().addAction(Action.PAN).build())
             .build()
+    }
+
+    /** Keyboard entry for the IPTV tab's search field; matching channels are listed under it. */
+    private inner class ChannelSearchScreen(ctx: CarContext) : Screen(ctx) {
+        private var text = iptvSearch
+
+        private fun apply(q: String) {
+            iptvSearch = q.trim(); listScroll[0] = 0f; shellVersion++; overlayKey = ""
+            screenManager.pop()
+        }
+
+        override fun onGetTemplate(): Template {
+            val items = ItemList.Builder()
+            val q = text.trim().lowercase()
+            if (q.isNotEmpty()) {
+                IptvStorage.channels(carContext).filter { it.name.lowercase().contains(q) }.take(5).forEach { ch ->
+                    items.addItem(Row.Builder().setTitle(ch.name).addText(ch.group)
+                        .setImage(accentIcon(R.drawable.ic_car_tv), Row.IMAGE_TYPE_ICON)
+                        .setOnClickListener { iptvSearch = ""; shellVersion++; overlayKey = ""; screenManager.pop(); playFromShell(IptvPlaybackService.SEARCH_PREFIX + text.trim(), ch) }.build())
+                }
+            }
+            return SearchTemplate.Builder(object : SearchTemplate.SearchCallback {
+                override fun onSearchTextChanged(searchText: String) { text = searchText; invalidate() }
+                override fun onSearchSubmitted(searchTerm: String) = apply(searchTerm)
+            })
+                .setHeaderAction(Action.BACK)
+                .setSearchHint("Search channels")
+                .setInitialSearchText(iptvSearch)
+                .setShowKeyboardByDefault(true)
+                .setItemList(items.build())
+                .build()
+        }
     }
 
     /** Keyboard entry (SearchTemplate): a web address opens, other text is searched on Google. */
@@ -1036,6 +1360,9 @@ private class CarArtwork {
     private val tiles = HashMap<String, Bitmap>()
 
     /** Small logo for a list row; a letter tile while it loads (or if the channel has no logo). */
+    /** The downloaded logo tile if it has arrived (null while loading / on failure). */
+    fun cachedThumb(url: String): Bitmap? = thumbs.get(url)
+
     fun thumb(name: String, url: String?, onLoaded: () -> Unit): Bitmap {
         if (!url.isNullOrBlank() && url.startsWith("http")) {
             thumbs.get(url)?.let { return it }

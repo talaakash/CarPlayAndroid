@@ -392,6 +392,16 @@ class IptvNative {
     }
   }
 
+  /// Phone -> car, background: the car browser follows [url] without taking over the car screen.
+  /// Remembered, so a car that connects or reconnects later starts on the same page.
+  Future<SendToCarResult> syncBrowserUrl(String url) async {
+    try {
+      return SendToCarResult.parse(await _method.invokeMethod<String>('syncBrowserUrl', {'url': url}));
+    } catch (_) {
+      return SendToCarResult.noCar;
+    }
+  }
+
   /// Car -> phone: the car browser's current page (also emitted when it changes).
   Stream<CarBrowserState> get carBrowser =>
       _raw.where((e) => e['type'] == 'carBrowser').map(CarBrowserState.fromMap);

@@ -19,4 +19,10 @@ void main() {
     expect(BrowserInput.isWebUrl('file:///sdcard/a'), isFalse);
     expect(BrowserInput.isWebUrl(null), isFalse);
   });
+
+  test('sameBrowserPage ignores case, trailing slash and fragment', () {
+    expect(sameBrowserPage('https://Example.com/', 'https://example.com'), isTrue);
+    expect(sameBrowserPage('https://example.com/a#x', 'https://example.com/a'), isTrue);
+    expect(sameBrowserPage('https://example.com/a', 'https://example.com/b'), isFalse);
+  });
 }

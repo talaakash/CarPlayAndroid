@@ -68,7 +68,7 @@ internal class CarBrowserUi(private val ctx: Context) {
         val slot = bar * 1.1f
         var cx = slot * 0.7f
         val cy = bar / 2f
-        icon(c, R.drawable.ic_car_list, cx, cy, ic, Hit.HOME, true); cx += slot
+        icon(c, R.drawable.ic_car_home, cx, cy, ic, Hit.HOME, true); cx += slot
         icon(c, R.drawable.ic_car_chevron_left, cx, cy, ic * 1.15f, Hit.BACK, s.canBack); cx += slot
         icon(c, R.drawable.ic_car_chevron_right, cx, cy, ic * 1.15f, Hit.FORWARD, s.canForward); cx += slot
         icon(c, if (s.loading) R.drawable.ic_car_close else R.drawable.ic_car_refresh, cx, cy, ic, Hit.RELOAD, true)

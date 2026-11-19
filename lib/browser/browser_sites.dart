@@ -61,3 +61,13 @@ class BrowserInput {
     return u != null && (u.scheme == 'http' || u.scheme == 'https') && u.host.isNotEmpty;
   }
 }
+
+/// Same page ignoring case, a trailing slash and the #fragment (mirrors `WebUrls.same` on the car).
+bool sameBrowserPage(String a, String b) => _pageKey(a) == _pageKey(b);
+String _pageKey(String u) {
+  var k = u.split('#').first.toLowerCase();
+  while (k.endsWith('/')) {
+    k = k.substring(0, k.length - 1);
+  }
+  return k;
+}
