@@ -20,7 +20,7 @@ import androidx.core.content.ContextCompat
  */
 internal class CarPlayerUi(private val ctx: Context) {
 
-    enum class Hit { LIST, FAVORITE, FIT, PREV, PLAY, NEXT, SEEK }
+    enum class Hit { FAVORITE, FIT, PREV, PLAY, NEXT, SEEK }
 
     data class State(
         val title: String?,
@@ -85,14 +85,13 @@ internal class CarPlayerUi(private val ctx: Context) {
         val margin = fw * 0.03f
         val ic = fh * 0.085f
 
-        // top bar: title only (the host's own list/back button already sits at the edge)
+        // top bar: title only (the host's close button sits at the edge)
         val topY = fh * 0.08f
-        drawIcon(c, R.drawable.ic_car_list, margin + ic / 2, topY, ic, Hit.LIST)
         if (!s.title.isNullOrBlank()) {
             val tp = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 color = Color.WHITE; textSize = fh * 0.05f; typeface = Typeface.DEFAULT_BOLD
             }
-            val left = margin + ic * 1.5f
+            val left = margin
             val t = android.text.TextUtils.ellipsize(s.title, android.text.TextPaint(tp), (fw - left - margin).coerceAtLeast(10f), android.text.TextUtils.TruncateAt.END)
             c.drawText(t.toString(), left, topY + tp.textSize * 0.35f, tp)
         }

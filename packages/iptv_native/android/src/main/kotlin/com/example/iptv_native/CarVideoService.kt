@@ -664,7 +664,6 @@ private class CarVideoSession : Session() {
         if (hit == null) { uiHandler.removeCallbacks(hideUi); uiVisible = false; updateOverlay(); return } // tap on the picture hides the UI
         scheduleHide()
         when (hit) {
-            CarPlayerUi.Hit.LIST -> try { carContext.getCarService(androidx.car.app.ScreenManager::class.java).pop() } catch (_: Throwable) {}
             CarPlayerUi.Hit.PREV -> b?.seekToPreviousMediaItem()
             CarPlayerUi.Hit.NEXT -> b?.seekToNextMediaItem()
             CarPlayerUi.Hit.SEEK -> {}
@@ -848,7 +847,7 @@ private class CarVideoSession : Session() {
                 .setBackgroundColor(CarColor.createCustom(Color.BLACK, Color.BLACK))
                 .setActionStrip(
                     ActionStrip.Builder()
-                        .addAction(Action.Builder().setIcon(icon(R.drawable.ic_car_blank))
+                        .addAction(Action.Builder().setIcon(icon(R.drawable.ic_car_close))
                             .setOnClickListener { screenManager.pop() }.build())
                         .build()
                 )
@@ -1200,9 +1199,7 @@ private class CarVideoSession : Session() {
             .setActionStrip(
                 ActionStrip.Builder()
                     .addAction(
-                        if (screenManager.screenStack.size > 1) Action.Builder().setTitle("Menu").setIcon(icon(R.drawable.ic_car_list))
-                            .setOnClickListener { screenManager.popToRoot() }.build()
-                        else Action.Builder().setTitle("Player").setIcon(icon(R.drawable.ic_car_nowplaying))
+                        Action.Builder().setIcon(icon(R.drawable.ic_car_video))
                             .setOnClickListener { if (browser?.mediaItemCount ?: 0 > 0) openPlayer() }.build())
                     .build()
             )
