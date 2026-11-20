@@ -298,6 +298,17 @@ class IptvNative {
   }
 
   Future<void> setVideoOutput(VideoOutput o) => _method.invokeMethod('setOutput', {'output': o.name});
+  Future<bool> getAllowUnknownSpeed() async {
+    try {
+      return await _method.invokeMethod<bool>('getAllowUnknownSpeed') ?? false;
+    } on MissingPluginException {
+      return false;
+    }
+  }
+
+  Future<void> setAllowUnknownSpeed(bool allow) =>
+      _method.invokeMethod('setAllowUnknownSpeed', {'allow': allow});
+
   Future<void> setVideoFit(VideoFit f) => _method.invokeMethod('setFit', {'fit': f.name});
 
   Stream<ParkedVideoInfo> get parkedVideo => _raw

@@ -115,6 +115,8 @@ class SettingsScreen extends StatelessWidget {
             const _Header('Playback'),
             SwitchListTile(title: const Text('Picture-in-picture when leaving the app'), value: s.autoPip, onChanged: (v) => s.setPlayback(autoPip: v)),
             SwitchListTile(title: const Text('Keep screen on while watching'), value: s.keepScreenOn, onChanged: (v) => s.setPlayback(keepScreenOn: v)),
+            const _Header('Car'),
+            const _AllowUnknownSpeedTile(),
             if (kDebugMode) ...[
               const _Header('Developer: driving restriction'),
               ListTile(
@@ -147,5 +149,38 @@ class _Header extends StatelessWidget {
   Widget build(BuildContext context) => Padding(
         padding: const EdgeInsets.fromLTRB(16, 16, 16, 4),
         child: Text(text, style: Theme.of(context).textTheme.titleSmall?.copyWith(color: Theme.of(context).colorScheme.primary)),
+      );
+}
+
+/// Opt-in for cars / head units that do not report vehicle speed (release builds otherwise
+/// show audio only on the car display).
+class _AllowUnknownSpeedTile extends StatefulWidget {
+  const _AllowUnknownSpeedTile();
+
+  @override
+  State<_AllowUnknownSpeedTile> createState() => _AllowUnknownSpeedTileState();
+}
+
+class _AllowUnknownSpeedTileState extends State<_AllowUnknownSpeedTile> {
+  bool _value = false;
+
+  @override
+  void initState() {
+    super.initState();
+    IptvNative.instance.getAllowUnknownSpeed().then((v) {
+      if (mounted) setState(() => _value = v);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) => SwitchListTile(
+        title: const Text('Allow video when speed is unavailable'),
+        subtitle: const Text(
+            'Show video on the car display even if the car does not report its speed. Video is still hidden when the car reports it is moving.'),
+        value: _value,
+        onChanged: (v) {
+          setState(() => _value = v);
+          IptvNative.instance.setAllowUnknownSpeed(v);
+        },
       );
 }

@@ -77,7 +77,8 @@ import androidx.media3.session.SessionToken
  *
  * NOTE: the Surface comes from the NAVIGATION category, which is outside Google Play's car-app
  * policy; use for personal / sideloaded builds. Video is shown only while the car reports speed ~0
- * (unknown speed hides video except in debuggable builds, so the Desktop Head Unit works).
+ * (unknown speed hides video except in debuggable builds or when the user enables
+ * "Allow video when speed is unavailable" in the phone settings).
  */
 class CarVideoService : CarAppService() {
     /**
@@ -221,7 +222,9 @@ private class CarVideoSession : Session() {
     private fun videoAllowed(): Boolean = when (moving) {
         false -> true
         true -> false
-        null -> carContext.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+        // Speed unknown: debuggable builds (Desktop Head Unit) or the user's opt-in setting.
+        null -> carContext.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0 ||
+            IptvStorage.allowUnknownSpeed(carContext)
     }
 
     /** Single place that decides whether the car renders the video or the artwork. */

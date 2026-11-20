@@ -409,6 +409,11 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
                 IptvStorage.setVideoFit(appContext, call.argument<String>("fit") ?: IptvStorage.FIT)
                 result.success(null)
             }
+            "getAllowUnknownSpeed" -> result.success(IptvStorage.allowUnknownSpeed(appContext))
+            "setAllowUnknownSpeed" -> {
+                IptvStorage.setAllowUnknownSpeed(appContext, call.argument<Boolean>("allow") ?: false)
+                result.success(null)
+            }
             "connection" -> result.success(connectionMap())
             "sendBrowserUrl" -> {
                 val r = CarBrowserBridge.send(call.argument<String>("url"), carConnected())

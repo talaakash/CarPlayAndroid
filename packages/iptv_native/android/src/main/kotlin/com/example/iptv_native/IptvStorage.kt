@@ -75,6 +75,20 @@ object IptvStorage {
         return true
     }
 
+    /**
+     * Opt-in: show car video / browser even when the car does not report its speed. Off by
+     * default; the car still hides video whenever it explicitly reports that it is moving.
+     */
+    fun allowUnknownSpeed(context: Context): Boolean =
+        prefs(context).getBoolean("allow_unknown_speed", false)
+
+    fun setAllowUnknownSpeed(context: Context, allow: Boolean): Boolean {
+        if (allowUnknownSpeed(context) == allow) return false
+        prefs(context).edit().putBoolean("allow_unknown_speed", allow).commit()
+        fireChange("settings")
+        return true
+    }
+
     private val lock = Any()
     private var cachedStamp = -1L
     private var cachedChannels: List<Channel> = emptyList()
