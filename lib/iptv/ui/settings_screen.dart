@@ -1,4 +1,5 @@
 import 'package:flutter/foundation.dart' show kDebugMode;
+import 'package:flutter/services.dart' show Clipboard, ClipboardData;
 import 'package:iptv_native/iptv_native.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:provider/provider.dart';
@@ -117,6 +118,8 @@ class SettingsScreen extends StatelessWidget {
             SwitchListTile(title: const Text('Keep screen on while watching'), value: s.keepScreenOn, onChanged: (v) => s.setPlayback(keepScreenOn: v)),
             const _Header('Car'),
             const _AllowUnknownSpeedTile(),
+            const _Header('Diagnostics'),
+            const _DiagnosticsTile(),
             if (kDebugMode) ...[
               const _Header('Developer: driving restriction'),
               ListTile(
@@ -183,4 +186,62 @@ class _AllowUnknownSpeedTileState extends State<_AllowUnknownSpeedTile> {
           IptvNative.instance.setAllowUnknownSpeed(v);
         },
       );
+}
+
+/// Android Auto debug log: recorded automatically on every car connection, exported here.
+class _DiagnosticsTile extends StatefulWidget {
+  const _DiagnosticsTile();
+
+  @override
+  State<_DiagnosticsTile> createState() => _DiagnosticsTileState();
+}
+
+class _DiagnosticsTileState extends State<_DiagnosticsTile> {
+  int _bytes = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _refresh();
+  }
+
+  Future<void> _refresh() async {
+    final b = await IptvNative.instance.aaLogBytes();
+    if (mounted) setState(() => _bytes = b);
+  }
+
+  Future<void> _copy() async {
+    final text = await IptvNative.instance.aaLogRead();
+    await Clipboard.setData(ClipboardData(text: text));
+    if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Log copied (last part)')));
+  }
+
+  Future<void> _clear() async {
+    await IptvNative.instance.aaLogClear();
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+    await _refresh();
+  }
+
+  @override
+  Widget build(BuildContext context) => Column(children: [
+        ListTile(
+          leading: const Icon(Icons.bug_report_outlined),
+          title: const Text('Android Auto debug log'),
+          subtitle: Text('Recorded automatically while connected to a car. ${(_bytes / 1024).toStringAsFixed(0)} KB stored.'),
+          trailing: IconButton(icon: const Icon(Icons.refresh), onPressed: _refresh),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: Wrap(spacing: 8, children: [
+            FilledButton.icon(
+              onPressed: () async { await IptvNative.instance.aaLogShare(); },
+              icon: const Icon(Icons.ios_share),
+              label: const Text('Export / share'),
+            ),
+            OutlinedButton.icon(onPressed: _copy, icon: const Icon(Icons.copy), label: const Text('Copy')),
+            OutlinedButton.icon(onPressed: _clear, icon: const Icon(Icons.delete_outline), label: const Text('Clear')),
+          ]),
+        ),
+        const SizedBox(height: 12),
+      ]);
 }

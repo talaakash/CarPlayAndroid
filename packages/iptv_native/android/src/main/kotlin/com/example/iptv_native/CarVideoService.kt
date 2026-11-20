@@ -86,16 +86,50 @@ class CarVideoService : CarAppService() {
      * the Car App Library). Debuggable builds accept any host, because the Desktop Head Unit is not
      * signed like a production host.
      */
-    override fun createHostValidator(): HostValidator =
-        if (applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0) HostValidator.ALLOW_ALL_HOSTS_VALIDATOR
+    override fun createHostValidator(): HostValidator {
+        val debuggable = applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE != 0
+        AaLog.i("service", "createHostValidator debuggable=$debuggable -> ${if (debuggable) "ALLOW_ALL_HOSTS" else "hosts_allowlist_sample"}")
+        return if (debuggable) HostValidator.ALLOW_ALL_HOSTS_VALIDATOR
         else HostValidator.Builder(applicationContext)
             .addAllowedHosts(androidx.car.app.R.array.hosts_allowlist_sample)
             .build()
+    }
 
-    override fun onCreateSession(): Session = CarVideoSession()
+    override fun onCreate() {
+        super.onCreate()
+        AaLog.logIdentity(this, "CarVideoService.onCreate")
+        AaLog.i("service", "CarVideoService created (activeSessions=${CarVideoSession.active.get()})")
+    }
+
+    override fun onDestroy() {
+        AaLog.i("service", "CarVideoService destroyed (activeSessions=${CarVideoSession.active.get()})")
+        super.onDestroy()
+    }
+
+    override fun onCreateSession(): Session {
+        AaLog.i("service", "onCreateSession (activeSessions=${CarVideoSession.active.get()})")
+        return CarVideoSession()
+    }
 }
 
 private class CarVideoSession : Session() {
+    private val sid = counter.incrementAndGet()
+    private fun log(m: String) = AaLog.i("session#$sid", m)
+    private fun templateLog(screenName: String, type: String) =
+        AaLog.i("session#$sid", "onGetTemplate screen=$screenName -> $type (top=${topName()} stack=${stackNames()})")
+    // Explicit names: release builds are minified, javaClass.simpleName would print "ye".
+    private fun screenName(s: Screen): String = when (s) {
+        is WebScreen -> "WebScreen"
+        is VideoScreen -> "VideoScreen"
+        is TabsScreen -> "TabsScreen(old-list-ui)"
+        is BrowseScreen -> "BrowseScreen(old-list-ui)"
+        is BrowserHomeScreen -> "BrowserHomeScreen(old-list-ui)"
+        is ChannelSearchScreen -> "ChannelSearchScreen"
+        is SearchScreen -> "SearchScreen"
+        else -> "Screen"
+    }
+    private fun topName() = try { screenName(carContext.getCarService(androidx.car.app.ScreenManager::class.java).top) } catch (_: Throwable) { "?" }
+    private fun stackNames() = try { carContext.getCarService(androidx.car.app.ScreenManager::class.java).screenStack.joinToString(">") { screenName(it) } } catch (_: Throwable) { "?" }
     private var browser: MediaBrowser? = null
     /** GL owner of the host Surface (video and artwork both go through it). */
     private var renderer: CarVideoRenderer? = null
@@ -149,12 +183,12 @@ private class CarVideoSession : Session() {
 
     private val surfaceCallback = object : SurfaceCallback {
         override fun onSurfaceAvailable(surfaceContainer: SurfaceContainer) {
-            android.util.Log.i(TAG, "surface available ${surfaceContainer.width}x${surfaceContainer.height} webActive=$webActive")
+            AaLog.i("session#$sid", "surface available ${surfaceContainer.width}x${surfaceContainer.height} webActive=$webActive")
             dropRenderer()
-            surfaceContainer.surface?.let { renderer = CarVideoRenderer(it).takeIf { r -> r.inputSurface != null } }
-            android.util.Log.i(TAG, "renderer ready=${renderer != null} surfaceNull=${surfaceContainer.surface == null}")
-            renderer?.setVisibleArea(effectiveArea()) // the area callback may have arrived first
-            sync()
+            uiHandler.removeCallbacks(rendererRetry)
+            if (ownSurfaceRequest) ownSurfaceRequest = false else rendererAttempts = 0 // our own reset must not restart the retry budget
+            hostSurface = surfaceContainer.surface
+            createRenderer("surfaceAvailable")
         }
 
         override fun onVisibleAreaChanged(visibleArea: android.graphics.Rect) {
@@ -187,7 +221,9 @@ private class CarVideoSession : Session() {
         }
 
         override fun onSurfaceDestroyed(surfaceContainer: SurfaceContainer) {
-            android.util.Log.i(TAG, "surface destroyed")
+            AaLog.i("session#$sid", "surface destroyed")
+            uiHandler.removeCallbacks(rendererRetry)
+            hostSurface = null
             dropRenderer()
             sync()
         }
@@ -208,10 +244,65 @@ private class CarVideoSession : Session() {
         updateOverlay()
     }
 
+    // ---- GL owner of the host Surface ----
+    /** Host Surface from the last onSurfaceAvailable (valid until onSurfaceDestroyed). */
+    private var hostSurface: Surface? = null
+    private var rendererAttempts = 0
+    private var ownSurfaceRequest = false
+    private val rendererRetry = Runnable { createRenderer("retry#$rendererAttempts") }
+
+    /**
+     * Creates the GL renderer for the host Surface. Right after an APK replace, a process restart or a
+     * quick reconnect the Surface can still be connected to the PREVIOUS process / session (EGL_BAD_ALLOC,
+     * "already connected to another API"). Giving up there leaves the host showing the last frame of that
+     * earlier instance - i.e. the OLD UI - so creation is retried until the old producer is gone.
+     */
+    private fun createRenderer(origin: String) {
+        val surf = hostSurface ?: return
+        if (renderer != null) return
+        val r = CarVideoRenderer(surf)
+        if (r.inputSurface != null) {
+            renderer = r
+            AaLog.i("session#$sid", "renderer ready ($origin, attempts=$rendererAttempts)")
+            rendererAttempts = 0
+            r.setVisibleArea(effectiveArea()) // the area callback may have arrived first
+            overlayKey = ""
+            sync()
+            return
+        }
+        r.release()
+        val delays = RENDERER_RETRY_MS
+        // The old surface may never be released by its previous owner: after a couple of quick retries
+        // reset the callback so the host destroys it and delivers a brand-new Surface.
+        // 2nd failure: ask the host to bring this app forward again (what a manual re-open does);
+        // 6th: reset the surface callback.
+        if (rendererAttempts == 2) bringToFront()
+        if (rendererAttempts == 6) requestFreshSurface()
+        if (rendererAttempts < delays.size) {
+            val d = delays[rendererAttempts++]
+            if (rendererAttempts == 1) AaLog.snapshotSystemLog("renderer NOT ready")
+            AaLog.w("session#$sid", "renderer NOT ready ($origin): host Surface still held by a previous instance -> the car would keep showing its stale frame; retry in ${d}ms (attempt $rendererAttempts/${delays.size})")
+            uiHandler.postDelayed(rendererRetry, d)
+        } else {
+            AaLog.e("session#$sid", "renderer NOT ready after ${delays.size} retries; asking the host for a fresh surface")
+            requestFreshSurface()
+        }
+    }
+
+    private fun requestFreshSurface() {
+        AaLog.w("session#$sid", "requesting a fresh host surface (setSurfaceCallback reset)")
+        try {
+            ownSurfaceRequest = true
+            val am = carContext.getCarService(AppManager::class.java)
+            am.setSurfaceCallback(null)
+            am.setSurfaceCallback(surfaceCallback)
+        } catch (t: Throwable) { AaLog.e("session#$sid", "fresh surface request failed", t) }
+    }
+
     private fun dropRenderer() {
         webBrowser.detach()
         webAttachTried = false
-        if (attached) { IptvPlaybackService.clearCarSurface(); attached = false }
+        if (attached) { IptvPlaybackService.clearCarSurface(renderer); attached = false }
         renderer?.release()
         renderer = null
     }
@@ -236,9 +327,10 @@ private class CarVideoSession : Session() {
                 // Same Surface, same renderer: only the player's output changes, nothing else.
                 IptvPlaybackService.setCarSurface(r)
                 attached = true
+                log("video initialised: player output attached to car surface (outputIsCar=${outputIsCar()} moving=$moving)")
             }
         } else if (attached) {
-            IptvPlaybackService.clearCarSurface()
+            IptvPlaybackService.clearCarSurface(r)
             attached = false
         }
         if (r != null) {
@@ -253,7 +345,7 @@ private class CarVideoSession : Session() {
 
     /** Browser on screen: show the page when parked, otherwise a black screen with the driving message. */
     private fun syncWeb(r: CarVideoRenderer) {
-        android.util.Log.i(TAG, "syncWeb allowed=${videoAllowed()} attached=${webBrowser.attached} tried=$webAttachTried")
+        AaLog.i("session#$sid", "syncWeb allowed=${videoAllowed()} attached=${webBrowser.attached} tried=$webAttachTried")
         if (shellTab != CarShellUi.NAV_BROWSER || webHome) {
             // IPTV / Local Video / the browser home are drawn screens: no WebView runs (page + history are kept for later).
             if (webBrowser.attached) { webBrowser.detach(); webAttachTried = false }
@@ -264,7 +356,9 @@ private class CarVideoSession : Session() {
             if (!webBrowser.attached && !webAttachTried) {
                 webAttachTried = true
                 val (aw, ah) = r.areaSize()
-                if (webBrowser.attach(r, aw, ah, CarBrowserUi.barHeight(ah))) { r.showWeb(aw, ah); onWebChanged() }
+                val ok = webBrowser.attach(r, aw, ah, CarBrowserUi.barHeight(ah))
+                log("browser initialised: attach=$ok area=${aw}x$ah")
+                if (ok) { r.showWeb(aw, ah); onWebChanged() }
             }
         } else {
             if (webBrowser.attached) { webBrowser.detach(); webAttachTried = false }
@@ -279,7 +373,7 @@ private class CarVideoSession : Session() {
 
     /** Loads [url] in the car browser and brings the browser screen to the front. */
     private fun loadInCar(url: String) {
-        android.util.Log.i(TAG, "loadInCar (screens=${carContext.getCarService(androidx.car.app.ScreenManager::class.java).screenStack.size}, renderer=${renderer != null})")
+        AaLog.i("session#$sid", "loadInCar (screens=${carContext.getCarService(androidx.car.app.ScreenManager::class.java).screenStack.size}, renderer=${renderer != null})")
         webBrowser.load(url)
         openWeb(home = false)
         if (renderer == null) bringToFront()
@@ -291,9 +385,9 @@ private class CarVideoSession : Session() {
             carContext.startCarApp(
                 Intent(Intent.ACTION_VIEW).setComponent(ComponentName(carContext, CarVideoService::class.java)),
             )
-            android.util.Log.i(TAG, "startCarApp requested")
+            AaLog.i("session#$sid", "startCarApp requested")
         } catch (t: Throwable) {
-            android.util.Log.w(TAG, "startCarApp failed: ${t.javaClass.simpleName}")
+            AaLog.w("session#$sid", "startCarApp failed: ${t.javaClass.simpleName}")
         }
     }
 
@@ -301,6 +395,7 @@ private class CarVideoSession : Session() {
         if (shellTab != CarShellUi.NAV_BROWSER) { shellTab = CarShellUi.NAV_BROWSER; overlayKey = ""; sync() }
         if (webHome != home) { webHome = home; homeScroll = 0f; overlayKey = ""; sync() }
         val sm = carContext.getCarService(androidx.car.app.ScreenManager::class.java)
+        log("navigate openWeb(home=$home) stack=${stackNames()}")
         if (sm.screenStack.any { it.marker == WEB_MARKER }) sm.popTo(WEB_MARKER)
         else sm.push(WebScreen(carContext).also { it.marker = WEB_MARKER })
     }
@@ -769,13 +864,31 @@ private class CarVideoSession : Session() {
     private var historyPending = false
     private var browserHome: Screen? = null
 
+    override fun onNewIntent(intent: Intent) {
+        log("onNewIntent action=${intent.action} data=${intent.dataString} stack=${stackNames()}")
+    }
+
     override fun onCreateScreen(intent: Intent): Screen {
         val ctx = carContext
+        active.incrementAndGet()
+        AaLog.logIdentity(ctx, "session#$sid.onCreateScreen")
+        log("onCreateScreen intent=${intent.action} carApiLevel=${ctx.carAppApiLevel} activeSessions=${active.get()} carUiRevision=${AaLog.CAR_UI_REVISION}")
+        try {
+            val h = ctx.hostInfo
+            log("host=${h?.packageName} uid=${h?.uid} hostApi=${ctx.carAppApiLevel} isDarkCar=${ctx.isDarkMode} " +
+                "display=${ctx.resources.displayMetrics.widthPixels}x${ctx.resources.displayMetrics.heightPixels}@${ctx.resources.displayMetrics.densityDpi}dpi")
+        } catch (t: Throwable) { log("host info unavailable: ${t.javaClass.simpleName}") }
+        lifecycle.addObserver(object : androidx.lifecycle.LifecycleEventObserver {
+            override fun onStateChanged(source: LifecycleOwner, event: androidx.lifecycle.Lifecycle.Event) {
+                log("lifecycle $event (stack=${stackNames()})")
+            }
+        })
         // Connecting also starts the playback service when the phone UI is not running.
         val token = SessionToken(ctx, ComponentName(ctx, IptvPlaybackService::class.java))
         val future = MediaBrowser.Builder(ctx, token).buildAsync()
         future.addListener({
-            browser = try { future.get() } catch (_: Exception) { null }
+            browser = try { future.get() } catch (t: Exception) { AaLog.e("session#$sid", "MediaBrowser connect failed", t); null }
+            log("MediaBrowser connected=${browser != null}")
             browser?.addListener(object : Player.Listener {
                 override fun onEvents(player: Player, events: Player.Events) {
                     invalidateTop()
@@ -790,7 +903,11 @@ private class CarVideoSession : Session() {
         try {
             ctx.getCarService(AppManager::class.java).setSurfaceCallback(surfaceCallback)
             shellOk = true
-        } catch (_: Throwable) { /* ACCESS_SURFACE not granted: no video, browsing still works */ }
+            log("setSurfaceCallback OK -> shell UI (WebScreen) will be the home screen")
+        } catch (t: Throwable) {
+            /* ACCESS_SURFACE not granted: no video, browsing still works */
+            AaLog.e("session#$sid", "setSurfaceCallback FAILED -> FALLBACK to the old list UI", t)
+        }
 
         try {
             val info = ctx.getCarService(CarHardwareManager::class.java).carInfo
@@ -798,6 +915,7 @@ private class CarVideoSession : Session() {
             info.addSpeedListener(ContextCompat.getMainExecutor(ctx), speedListener)
         } catch (_: Throwable) { moving = null }
 
+        log("config loaded: output=${IptvStorage.outputMode(ctx)} fit=${IptvStorage.videoFit(ctx)} allowUnknownSpeed=${IptvStorage.allowUnknownSpeed(ctx)} speedKnown=${moving != null} browserLastPage=${CarBrowserBridge.lastPage}")
         IptvPlaybackService.setFill(IptvStorage.videoFit(ctx) == IptvStorage.FILL)
         IptvStorage.addChangeListener(changeListener)
         BrowserHistory.addListener(historyListener)
@@ -805,6 +923,10 @@ private class CarVideoSession : Session() {
 
         lifecycle.addObserver(object : DefaultLifecycleObserver {
             override fun onDestroy(owner: LifecycleOwner) {
+                uiHandler.removeCallbacks(rendererRetry)
+                hostSurface = null
+                active.decrementAndGet()
+                log("session destroyed (activeSessions=${active.get()})")
                 IptvStorage.removeChangeListener(changeListener)
                 BrowserHistory.removeListener(historyListener)
                 uiHandler.removeCallbacks(hideUi)
@@ -820,9 +942,33 @@ private class CarVideoSession : Session() {
         // Phone -> car: a URL sent before this session existed is delivered right away.
         CarBrowserBridge.attach(carSide)
         // Home screen: IPTV / Local Video / Browser tabs; older hosts fall back to the channel list.
-        return if (shellOk) WebScreen(ctx).also { it.marker = WEB_MARKER } // phone-style IPTV / Local Video / Browser, drawn on the Surface
+        val first: Screen = if (shellOk) WebScreen(ctx).also { it.marker = WEB_MARKER } // phone-style IPTV / Local Video / Browser, drawn on the Surface
         else if (tabsSupported) TabsScreen(ctx).also { tabs = it }
         else BrowseScreen(ctx, IptvPlaybackService.HOME, "IPTV", isRoot = true)
+        if (first !is WebScreen) AaLog.snapshotSystemLog("fallback to old UI")
+        AaLog.w("session#$sid", "FALLBACK to older screen ${screenName(first)} (shellOk=$shellOk tabsSupported=$tabsSupported carApi=${ctx.carAppApiLevel}); will retry the surface on start")
+        log("initial screen = ${screenName(first)}")
+        // The old list UI is only a last resort: if the host refused the surface at creation, ask again
+        // once the session is visible and, when granted, replace the old root with the shell UI.
+        lifecycle.addObserver(object : DefaultLifecycleObserver {
+            override fun onStart(owner: LifecycleOwner) { if (!shellOk) upgradeToShell(first) }
+        })
+        return first
+    }
+
+    /** Retries the surface request; on success the old list UI root is replaced by the shell (WebScreen). */
+    private fun upgradeToShell(oldRoot: Screen) {
+        try {
+            carContext.getCarService(AppManager::class.java).setSurfaceCallback(surfaceCallback)
+        } catch (t: Throwable) {
+            AaLog.e("session#$sid", "surface retry FAILED - staying on the old list UI", t)
+            return
+        }
+        shellOk = true
+        log("surface retry OK -> replacing old list UI with WebScreen")
+        val sm = carContext.getCarService(androidx.car.app.ScreenManager::class.java)
+        sm.push(WebScreen(carContext).also { it.marker = WEB_MARKER })
+        try { sm.remove(oldRoot) } catch (t: Throwable) { AaLog.w("session#$sid", "could not remove old root: ${t.javaClass.simpleName}") }
     }
 
     private fun invalidateTop() {
@@ -835,6 +981,7 @@ private class CarVideoSession : Session() {
         uiVisible = true
         scheduleHide()
         val sm = carContext.getCarService(androidx.car.app.ScreenManager::class.java)
+        log("navigate openPlayer stack=${stackNames()}")
         if (sm.screenStack.any { it.marker == PLAYER_MARKER }) sm.popTo(PLAYER_MARKER)
         else sm.push(VideoScreen(carContext).also { it.marker = PLAYER_MARKER; screen = it })
     }
@@ -843,6 +990,7 @@ private class CarVideoSession : Session() {
 
     private inner class VideoScreen(ctx: CarContext) : Screen(ctx) {
         override fun onGetTemplate(): Template {
+            templateLog("VideoScreen", "NavigationTemplate")
             // Everything else (title, favorite, fit/fill, LIVE bar, prev / play / next) is drawn over
             // the video by CarPlayerUi and handled in onClick. The host strip keeps one entry
             // (back to the list) as the required action and as the non-touch fallback.
@@ -1025,6 +1173,7 @@ private class CarVideoSession : Session() {
         }
 
         override fun onGetTemplate(): Template {
+            templateLog("BrowseScreen($parentId)", "ListTemplate/Message (items=${items?.size} failed=$failed)")
             val b = browser
             if (b != null && !requested) load(b)
             val list = items
@@ -1142,6 +1291,7 @@ private class CarVideoSession : Session() {
         }
 
         override fun onGetTemplate(): Template {
+            templateLog("TabsScreen", "TabTemplate (active=$active)")
             val content: Template = when (active) {
                 TAB_LOCAL -> local.onGetTemplate()
                 TAB_BROWSER -> ListTemplate.Builder().setSingleList(browserRows { faviconLoaded() }).build()
@@ -1175,6 +1325,7 @@ private class CarVideoSession : Session() {
             })
         }
         override fun onGetTemplate(): Template = ListTemplate.Builder()
+            .also { templateLog("BrowserHomeScreen", "ListTemplate") }
             .setTitle("Browser").setHeaderAction(Action.BACK)
             .setSingleList(browserRows {
                 ContextCompat.getMainExecutor(carContext).execute {
@@ -1187,9 +1338,9 @@ private class CarVideoSession : Session() {
     private inner class WebScreen(ctx: CarContext) : Screen(ctx) {
         init {
             lifecycle.addObserver(object : DefaultLifecycleObserver {
-                override fun onStart(owner: LifecycleOwner) { android.util.Log.i(TAG, "web screen start"); webActive = true; overlayKey = ""; sync(); onWebChanged() }
+                override fun onStart(owner: LifecycleOwner) { AaLog.i("session#$sid", "web screen start"); webActive = true; overlayKey = ""; sync(); onWebChanged() }
                 override fun onStop(owner: LifecycleOwner) {
-                    android.util.Log.i(TAG, "web screen stop")
+                    AaLog.i("session#$sid", "web screen stop")
                     webActive = false; overlayKey = ""
                     onWebChanged()
                     sync() // video / artwork come back; the page is kept for later
@@ -1198,6 +1349,7 @@ private class CarVideoSession : Session() {
         }
 
         override fun onGetTemplate(): Template = NavigationTemplate.Builder()
+            .also { templateLog("WebScreen", "NavigationTemplate (shellTab=$shellTab webHome=$webHome browserAttached=${webBrowser.attached})") }
             .setBackgroundColor(CarColor.createCustom(Color.WHITE, Color.WHITE))
             .setActionStrip(
                 ActionStrip.Builder()
@@ -1221,6 +1373,7 @@ private class CarVideoSession : Session() {
         }
 
         override fun onGetTemplate(): Template {
+            templateLog("ChannelSearchScreen", "SearchTemplate")
             val items = ItemList.Builder()
             val q = text.trim().lowercase()
             if (q.isNotEmpty()) {
@@ -1254,6 +1407,7 @@ private class CarVideoSession : Session() {
         }
 
         override fun onGetTemplate(): Template {
+            templateLog("SearchScreen", "SearchTemplate")
             val items = ItemList.Builder()
             if (text.isNotBlank()) {
                 val target = WebUrls.resolve(text)
@@ -1280,8 +1434,11 @@ private class CarVideoSession : Session() {
         }
     }
 
-    private companion object {
+    companion object {
         const val TAG = "CarBrowser"
+        val RENDERER_RETRY_MS = longArrayOf(150, 300, 600, 1000, 1500, 2000, 3000, 4000, 6000, 8000)
+        val active = java.util.concurrent.atomic.AtomicInteger(0)
+        private val counter = java.util.concurrent.atomic.AtomicInteger(0)
         const val PLAYER_MARKER = "player"
         const val WEB_MARKER = "web"
         const val TAB_IPTV = "iptv"
@@ -1412,7 +1569,7 @@ private class CarArtwork {
         return b
     }
 
-    private companion object { const val TILE = 96 }
+    companion object { const val TILE = 96 }
 
     private fun fetch(url: String, onLoaded: () -> Unit) {
         synchronized(loading) { if (url in failed || !loading.add(url)) return }

@@ -23,6 +23,17 @@
             </intent-filter>
         </service>
 
+        <!-- Shares the exported Android Auto debug log. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.aalogs"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/aa_log_paths" />
+        </provider>
+
         <!-- Media3 library service: the single playback engine. Android Auto,
              Bluetooth / car media buttons, Google Assistant and the Flutter UI all
              talk to this service. -->

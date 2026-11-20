@@ -297,6 +297,22 @@ class IptvNative {
     }
   }
 
+  // ---- Android Auto diagnostics log (exported from Settings > Diagnostics) ----------------
+  Future<int> aaLogBytes() async {
+    try { return (await _method.invokeMethod<Map<Object?, Object?>>('aaLogInfo'))?['bytes'] as int? ?? 0; }
+    on MissingPluginException { return 0; }
+  }
+  Future<String> aaLogRead() async {
+    try { return await _method.invokeMethod<String>('aaLogRead') ?? ''; }
+    on MissingPluginException { return ''; }
+  }
+  Future<void> aaLogShare() async {
+    try { await _method.invokeMethod('aaLogShare'); } on MissingPluginException { /* no native side */ }
+  }
+  Future<void> aaLogClear() async {
+    try { await _method.invokeMethod('aaLogClear'); } on MissingPluginException { /* no native side */ }
+  }
+
   Future<void> setVideoOutput(VideoOutput o) => _method.invokeMethod('setOutput', {'output': o.name});
   Future<bool> getAllowUnknownSpeed() async {
     try {

@@ -56,6 +56,8 @@ class IptvPlaybackService : MediaLibraryService() {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        AaLog.logIdentity(this, "IptvPlaybackService.onCreate")
+        AaLog.i("playback", "IptvPlaybackService created")
 
         val http = DefaultHttpDataSource.Factory()
             .setAllowCrossProtocolRedirects(true)
@@ -228,6 +230,7 @@ class IptvPlaybackService : MediaLibraryService() {
         session = null
         player.release()
         if (instance === this) instance = null
+        AaLog.i("playback", "IptvPlaybackService destroyed")
         super.onDestroy()
     }
 
@@ -866,8 +869,15 @@ class IptvPlaybackService : MediaLibraryService() {
         }
 
         /** The car gives the output back (the renderer and its Surface stay alive, owned by the car session). */
-        fun clearCarSurface() {
+        fun clearCarSurface(owner: CarVideoRenderer? = null) {
             val old = carSurface ?: return
+            // A car session that is being torn down (disconnect / reconnect overlap) must not take the
+            // output away from the NEW session that already attached its own renderer.
+            if (owner != null && carRenderer !== owner) {
+                AaLog.w("playback", "clearCarSurface ignored: caller does not own the car surface (stale session teardown)")
+                return
+            }
+            AaLog.i("playback", "clearCarSurface")
             carSurface = null
             carRenderer = null
             instance?.player?.clearVideoSurface(old)

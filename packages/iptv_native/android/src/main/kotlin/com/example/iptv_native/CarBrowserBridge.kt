@@ -77,6 +77,7 @@ object CarBrowserBridge {
 
     /** The car session started: deliver a URL that was waiting for it, or restore the last page. */
     fun attach(car: CarSide) {
+        AaLog.i("bridge", "attach car side (previous=${side != null}) pending=${pending != null} lastPage=$lastPage")
         side = car
         val p = pending
         pending = null
@@ -89,6 +90,7 @@ object CarBrowserBridge {
     }
 
     fun detach(car: CarSide) {
+        AaLog.i("bridge", "detach car side (isCurrent=${side === car})")
         if (side === car) { side = null; publish(State()) }
     }
 

@@ -72,6 +72,7 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
     private var connectionType: Int? = null
     private val connectionObserver = Observer<Int> { type ->
         connectionType = type
+        AaLog.i("flutter", "CarConnection type=$type (0=none 1=native 2=projection)")
         ParkedVideoPolicy.setProjected(type == CarConnection.CONNECTION_TYPE_PROJECTION)
         emit(connectionMap())
     }
@@ -81,6 +82,8 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
     override fun onAttachedToEngine(binding: FlutterPlugin.FlutterPluginBinding) {
         appContext = binding.applicationContext
         instance = this
+        AaLog.logIdentity(appContext, "Flutter engine attached")
+        AaLog.i("flutter", "engine attached; MethodChannel iptv_native/control + EventChannel iptv_native/events registered")
         methodChannel = MethodChannel(binding.binaryMessenger, "iptv_native/control").also {
             it.setMethodCallHandler(this)
         }
@@ -117,6 +120,7 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
+        AaLog.i("flutter", "engine detached")
         ParkedVideoPolicy.removeListener(policyListener)
         methodChannel?.setMethodCallHandler(null)
         eventChannel?.setStreamHandler(null)
@@ -331,6 +335,7 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
     // ---- MethodCallHandler -----------------------------------------------------------
 
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
+        if (call.method !in QUIET_METHODS) AaLog.i("flutter", "MethodChannel ${call.method}")
         when (call.method) {
             "storageDirectory" -> result.success(IptvStorage.dir(appContext).absolutePath)
             "state" -> result.success(stateMap())
@@ -401,6 +406,33 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
                 result.success(ParkedVideoPolicy.simulate(mode))
             }
             "settings" -> result.success(settingsMap())
+            "aaLogInfo" -> result.success(mapOf("bytes" to AaLog.sizeBytes()))
+            "aaLogRead" -> Thread {
+                try {
+                    val f = AaLog.buildExport(appContext)
+                    val txt = f.readText()
+                    val tail = if (txt.length > 60_000) txt.takeLast(60_000) else txt
+                    android.os.Handler(android.os.Looper.getMainLooper()).post { result.success(tail) }
+                } catch (t: Throwable) { android.os.Handler(android.os.Looper.getMainLooper()).post { result.error("aalog", t.message, null) } }
+            }.start()
+            "aaLogClear" -> { AaLog.clear(); AaLog.i("diagnostics", "log cleared by user"); result.success(null) }
+            "aaLogShare" -> Thread {
+                try {
+                    val f = AaLog.buildExport(appContext)
+                    val uri = androidx.core.content.FileProvider.getUriForFile(appContext, appContext.packageName + ".aalogs", f)
+                    val send = Intent(Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        putExtra(Intent.EXTRA_STREAM, uri)
+                        putExtra(Intent.EXTRA_SUBJECT, "Android Auto debug log")
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    val chooser = Intent.createChooser(send, "Export Android Auto log").apply { addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+                    android.os.Handler(android.os.Looper.getMainLooper()).post {
+                        try { (activity ?: appContext).startActivity(chooser); result.success(f.absolutePath) }
+                        catch (t: Throwable) { result.error("aalog", t.message, null) }
+                    }
+                } catch (t: Throwable) { android.os.Handler(android.os.Looper.getMainLooper()).post { result.error("aalog", t.message, null) } }
+            }.start()
             "setOutput" -> {
                 IptvStorage.setOutputMode(appContext, call.argument<String>("output") ?: IptvStorage.OUTPUT_PHONE)
                 result.success(null)
@@ -690,6 +722,7 @@ class IptvNativePlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallH
     }
 
     companion object {
+        private val QUIET_METHODS = setOf("state", "storageDirectory", "connection")
         private const val WINDOW = 100
         private const val REQ_PICK_VIDEOS = 7302
         private var instance: IptvNativePlugin? = null
